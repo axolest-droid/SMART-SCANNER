@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-app.py — SMART SCANNER (PIN-Protected Learning & Blank-Gap Trimming Edition)
+app.py — SMART SCANNER (Slanted-Margin Dewarp Vision + Layout Parser + KB Tags)
 ================================================================================
 AI INSTRUCTION MANUAL (যেকোনো এআই বটের জন্য নির্দেশনা):
 1. এই প্রোগ্রামের সমস্ত নিয়ম `knowledge_base.json` ফাইলে সংরক্ষিত আছে।
-2. প্রশ্নের নিচে উত্তর লেখার জন্য রাখা ফাঁকা জায়গা (Blank Writing Space) বাদ দেওয়ার লজিক
-   `trim_vertical_whitespace()` ফাংশনে এবং `MAX_BLANK_GAP_PT` স্লাইডারে নিয়ন্ত্রিত হয়।
-3. গিটহাবে নতুন নিয়ম সেভ করার জন্য `ADMIN_PIN` দ্বারা নিরাপত্তা নিশ্চিত করা হয়েছে।
+2. বাঁকা বা ভাঁজ হওয়া পাতার জন্য এতে কলাম ডিওয়ার্পিং (`dewarp_column`) এবং র‍্যানস্যাক
+   ঢালু মার্জিন ফিটিং (`fit_slanted_margin`) যুক্ত করা হয়েছে।
+3. মার্জিনের প্রথম টোকেনের প্রস্থ (প্রশ্ন নম্বর বনাম 'উত্তর:'/'ব্যাখ্যা:'), অপশন বৃত্ত এবং
+   নলেজ-বেস ট্যাগ একসাথে মিলিয়ে প্রতিটি প্রশ্ন নিখুঁতভাবে কাটা হয়।
 ================================================================================
 """
 
 import os
 import re
+import time
+import glob
 import json
+import random
 import base64
 import cv2
 import fitz
@@ -21,19 +25,20 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# উইন্ডোজ পিসিতে প্যাডেল ইঞ্জিন যেন ক্র্যাশ না করে তার নিরাপত্তা সেটিংস
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-
+# নিরাপদভাবে pytesseract ইমপোর্ট করা (পিসিতে না থাকলেও যেন কখনোই ক্র্যাশ না করে)
 try:
     import pytesseract
+    if os.name == "nt":
+        for _t_path in (
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+        ):
+            if os.path.exists(_t_path):
+                pytesseract.pytesseract.tesseract_cmd = _t_path
+                break
 except Exception:
     pytesseract = None
-
-try:
-    from paddleocr import PaddleOCR
-except Exception:
-    PaddleOCR = None
 
 try:
     import streamlit.components.v1 as components
@@ -52,26 +57,9 @@ from learning_engine import (
     KB_FILENAME
 )
 
-@st.cache_resource(show_spinner=False)
-def get_paddle_ocr_engine():
-    """প্যাডেল-ওসিআর মডেল মেমোরিতে একবারই লোড করে রাখে।"""
-    if PaddleOCR is None:
-        return None
-    for kwargs in (
-        {"use_angle_cls": True, "lang": "en", "show_log": False},
-        {"use_angle_cls": True, "lang": "en"},
-        {"lang": "en"},
-        {},
-    ):
-        try:
-            return PaddleOCR(**kwargs)
-        except Exception:
-            continue
-    return None
-
 # ১. পেজ কনফিগারেশন
 st.set_page_config(
-    page_title="SMART SCANNER",
+    page_title="SMART SCANNER • VISION v5.0",
     layout="centered",
     initial_sidebar_state="expanded"
 )
@@ -133,7 +121,7 @@ with st.sidebar:
             </svg>
             <span>সেটিংস</span>
         </span>
-        <span class="sb-engine-pill">STUDIO</span>
+        <span class="sb-engine-pill">VISION v5.0</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -176,7 +164,6 @@ with st.sidebar:
 
         APPLY_BATCH_BTN = st.button("প্রয়োগ")
 
-    # পিন-সুরক্ষিত লাইভ ট্রেনিং ও এক্স-রে প্যানেল
     with st.expander("স্মার্ট ট্রেনিং ও এক্স-রে", expanded=False):
         XRAY_MODE = st.checkbox("এক্স-রে মোড", value=False)
 
@@ -220,7 +207,6 @@ with st.sidebar:
                     else:
                         st.warning(msg)
 
-            # নতুন ট্যাগ অন্য ক্যাটাগরিতে থাকলে ১-শব্দের সিলেকশন
             c_state = st.session_state.get("sb_conflict_state")
             if c_state:
                 other_short = ", ".join(CAT_KEY_TO_LABEL.get(c, c) for c in c_state["other_cats"])
@@ -253,7 +239,6 @@ with st.sidebar:
                         st.rerun()
 
             st.markdown("---")
-            # সব ধরনের ডুপ্লিকেট ও সংঘর্ষের তালিকা এবং ক্যাটাগরি নির্বাচন
             conflicts_list, _ = find_all_tag_conflicts(KB)
             cat_choice_map = {
                 "প্রশ্ন": "question_tags",
@@ -285,7 +270,6 @@ with st.sidebar:
             else:
                 st.caption("✅ ডুপ্লিকেট নেই")
 
-            # যেকোনো বিদ্যমান ট্যাগ দেখা ও ক্যাটাগরি বদলানো/মোছার মিনিমাল টুল
             with st.popover("🔍 ট্যাগ তালিকা", use_container_width=True):
                 all_tag_items = []
                 for ck, clbl in [("question_tags", "প্রশ্ন"), ("solution_tags", "সমাধান"), ("header_noise_patterns", "জলছাপ")]:
@@ -356,13 +340,14 @@ eq_guard_kw_pattern = "|".join(re.escape(w) for w in EQ_GUARD_KW_LIST) if EQ_GUA
 noise_pattern_str = "|".join(HEADER_NOISE_LIST) if HEADER_NOISE_LIST else "Educationalpdf"
 
 NUM_RE = re.compile(
-    rf"^[\(\[]?(?:(?:{q_prefix_pattern})\s*[\.\:\-\ঃ\/\|]*\s*)?([0-9০-৯]{{1,3}})[\.\)\]\:\ঃ](?![0-9০-৯])",
+    rf"^[\(\[]?(?:(?:{q_prefix_pattern})\s*[\.\:\-\ঃ\/\|]*\s*)?([0-9০-৯]{{1,3}})(?:[\.\)\]\:\ঃ\…\-\?]+|(?=[A-Za-zঅ-ঔক-হ]))(?![0-9০-৯])",
     re.IGNORECASE
 )
 PURE_PREFIX_RE = re.compile(rf"^(?:{q_prefix_pattern})[\.\:\-\ঃ\/\|]*\s*[0-9০-৯]*$", re.IGNORECASE)
-OPT_TOKEN_RE = re.compile(r"^(?:[\(\[]?[a-dA-Dক-ঘ][\)\]\.]|[ⓐⓑⓒⓓⓔ①②③④])$")
+OPT_TOKEN_RE = re.compile(r"^(?:[\(\[]?[a-dA-Dক-ঘ][\)\]\.]|[ⓐⓑⓒⓓⓔ①②③④⑧⑨])$")
 BULLET_STOP_RE = re.compile(rf"^[{bullet_chars_escaped}]\s*")
 OPT_UNIT_RE = re.compile(rf"^(?:{unit_pattern}|10\^?)$", re.IGNORECASE)
+BOARD_TAG_RE = re.compile(r"[\[\(].*(?:1[0-9]|2[0-6]).*[\]\)]")
 
 SOL_WORD_CORE = (
     r"(?:[sS58\$][oO0aAeE][lL1Ii\|!t](?:[nNmMrRuU23\^\°\*\~\"\'\`\’\”\ⁿ\-\_]+)?|"
@@ -443,7 +428,7 @@ def line_has_solution_marker(line, joined_text, max_sol_x):
     return False, None
 
 # ==============================================================================
-# ৬. ইমেজ প্রসেসিং, বাঁকা বিভাজক রেখা ও স্মার্ট ব্ল্যাঙ্ক-গ্যাপ ছাঁটাই
+# ৬. ইমেজ প্রসেসিং, ডিওয়ার্পিং, ঢালু মার্জিন ও অপশন সার্কেল ডিটেকশন
 # ==============================================================================
 def parse_page_range(range_str, total_pages):
     range_str = range_str.strip()
@@ -475,8 +460,10 @@ def clip_is_dark(page, clip):
     return float(np.frombuffer(pix.samples, np.uint8).mean()) < 110
 
 def normalize_shadow_gray(gray_img):
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-    bg = cv2.morphologyEx(gray_img, cv2.MORPH_CLOSE, kernel)
+    h, w = gray_img.shape[:2]
+    small = cv2.resize(gray_img, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    bg_small = cv2.medianBlur(small, 31)
+    bg = cv2.resize(bg_small, (w, h), interpolation=cv2.INTER_LINEAR)
     return cv2.divide(gray_img, bg, scale=255)
 
 def get_ink_mask(gray_img):
@@ -484,21 +471,42 @@ def get_ink_mask(gray_img):
     blur = cv2.GaussianBlur(norm, (3, 3), 0)
     thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 14)
     clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    return clean > 0
+    return (clean > 0) | (norm < 188)
+
+def count_option_circles(gray_img, x0_pt, y0_pt, x1_pt, y1_pt):
+    """ওপেনসিভি দিয়ে অপশনের গোল বৃত্ত (ক, খ, গ, ঘ বা ⓐ, ⓑ, ⓒ, ⓓ) গণনা করে।"""
+    x0, y0 = max(0, int(x0_pt * SC)), max(0, int(y0_pt * SC))
+    x1, y1 = min(gray_img.shape[1], int(x1_pt * SC)), min(gray_img.shape[0], int(y1_pt * SC))
+    if x1 - x0 < 18 or y1 - y0 < 7:
+        return 0
+    roi = gray_img[y0:y1, x0:x1]
+    bw = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+    cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    circles = 0
+    min_d, max_d = int(4.8 * SC), int(17.5 * SC)
+    for c in cnts:
+        bx, by, bw_c, bh_c = cv2.boundingRect(c)
+        if min_d <= bw_c <= max_d and min_d <= bh_c <= max_d:
+            aspect = bw_c / float(max(1, bh_c))
+            if 0.65 <= aspect <= 1.48:
+                area = cv2.contourArea(c)
+                if area > 0.28 * (bw_c * bh_c):
+                    circles += 1
+    return circles
 
 def find_divider(gray_img, W, H):
-    x_start, x_end = int(W * 0.36 * SC), int(W * 0.64 * SC)
-    y_start, y_end = int(H * 0.10 * SC), int(H * 0.90 * SC)
+    x_start, x_end = int(W * 0.34 * SC), int(W * 0.66 * SC)
+    y_start, y_end = int(H * 0.08 * SC), int(H * 0.92 * SC)
     ink_full = get_ink_mask(gray_img).astype(np.uint8)
     roi = cv2.dilate(ink_full[y_start:y_end, x_start:x_end], np.ones((1, 3), np.uint8), iterations=1)
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(32 * SC)))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(30 * SC)))
     v_lines = cv2.morphologyEx(roi, cv2.MORPH_OPEN, v_kernel)
     col_sum = v_lines.sum(axis=0)
-    if col_sum.max() > int(35 * SC):
+    if col_sum.max() > int(30 * SC):
         return (x_start + int(np.argmax(col_sum))) / SC, True
     ink_sum = roi.sum(axis=0)
     row_cover = float((roi.sum(axis=1) > 0).mean())
-    if ink_sum.min() == 0 and row_cover >= 0.30:
+    if ink_sum.min() == 0 and row_cover >= 0.28:
         zero = (ink_sum == 0).astype(np.int8)
         best_len, best_start, run_start = 0, 0, None
         for i, v in enumerate(list(zero) + [0]):
@@ -508,58 +516,36 @@ def find_divider(gray_img, W, H):
                 if i - run_start > best_len:
                     best_len, best_start = i - run_start, run_start
                 run_start = None
-        if best_len >= int(8 * SC):
+        if best_len >= int(7 * SC):
             return (x_start + best_start + best_len / 2.0) / SC, True
     return W / 2.0, False
 
 def trace_slanted_divider(gray_img, W, H):
+    """বাঁকা কলাম বিভাজক রেখার ঢাল (Slope) ও অবস্থান নির্ণয় করে।"""
+    h_px, w_px = gray_img.shape[:2]
+    ink_u8 = get_ink_mask(gray_img).astype(np.uint8)
+    v_open = cv2.morphologyEx(ink_u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, int(h_px * 0.04)))))
+    lo, hi = int(w_px * 0.30), int(w_px * 0.70)
+    yy, xx = np.nonzero(v_open[:, lo:hi])
+    if len(xx) > int(h_px * 0.25):
+        xx = xx + lo
+        best_sc, best_s, best_x0 = 0, 0.0, w_px * 0.5
+        for s in np.arange(-0.07, 0.0701, 0.004):
+            x_proj = np.round(xx - s * yy).astype(int)
+            mn = int(x_proj.min())
+            hist = np.bincount(x_proj - mn)
+            smooth = np.convolve(hist, np.ones(5), mode="same")
+            idx = int(np.argmax(smooth))
+            if smooth[idx] > best_sc:
+                best_sc = float(smooth[idx])
+                best_s = float(s)
+                best_x0 = float(idx + mn)
+        if best_sc >= h_px * 0.28:
+            mid_div_pt = (best_x0 + best_s * (h_px * 0.5)) / SC
+            return mid_div_pt, True, best_s, lambda y_pt: float((best_x0 / SC) + best_s * float(y_pt))
+
     base_div, is_two_col = find_divider(gray_img, W, H)
-    if not is_two_col:
-        return base_div, False, 0.0, lambda _y: base_div
-
-    x_start, x_end = int(W * 0.35 * SC), int(W * 0.65 * SC)
-    blur = cv2.GaussianBlur(gray_img, (3, 3), 0)
-    thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 12)
-    roi = thresh[:, x_start:x_end]
-
-    h_px = gray_img.shape[0]
-    pts_y, pts_x = [], []
-    for y0 in range(int(0.06 * h_px), int(0.92 * h_px), int(25 * SC)):
-        y1 = min(h_px, y0 + int(40 * SC))
-        col_proj = roi[y0:y1, :].mean(axis=0)
-        best_c = int(np.argmax(col_proj))
-        if col_proj[best_c] > 105:
-            pts_y.append((y0 + y1) * 0.5 / SC)
-            pts_x.append((x_start + best_c) / SC)
-
-    if len(pts_x) >= 3:
-        med_x = float(np.median(pts_x))
-        inliers = [i for i in range(len(pts_x)) if abs(pts_x[i] - med_x) < 20.0]
-        if len(inliers) >= 2:
-            ys = np.array([pts_y[i] for i in inliers])
-            xs = np.array([pts_x[i] for i in inliers])
-            slope, intercept = np.polyfit(ys, xs, 1)
-            slope = float(np.clip(slope, -0.04, 0.04))
-            return med_x, True, slope, lambda y: float(slope * float(y) + intercept)
-
-    return base_div, True, 0.0, lambda _y: base_div
-
-def detect_horizontal_barriers(gray_img, x0, x1):
-    x0_px, x1_px = max(0, int(x0 * SC)), min(gray_img.shape[1], int(x1 * SC))
-    if x1_px - x0_px < 40:
-        return []
-    roi = get_ink_mask(gray_img[:, x0_px:x1_px]).astype(np.uint8)
-    min_w = max(30, int((x1 - x0) * 0.55 * SC))
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_w, 1))
-    h_lines = cv2.morphologyEx(roi, cv2.MORPH_OPEN, h_kernel)
-    thick_blobs = cv2.morphologyEx(roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 6)))
-    thin_lines = h_lines & (~thick_blobs)
-    y_coords = np.where(thin_lines.sum(axis=1) > (min_w * 0.85))[0] / SC
-    merged = []
-    for y in y_coords:
-        if not merged or y - merged[-1] > 6.0:
-            merged.append(float(y))
-    return merged
+    return base_div, is_two_col, 0.0, lambda _y: base_div
 
 def snap_cut_line(ink, xr, y_target, up_win=2.5, down_win=1.0):
     h_px, w_px = ink.shape
@@ -573,11 +559,6 @@ def snap_cut_line(ink, xr, y_target, up_win=2.5, down_win=1.0):
     return (a + best_row) / SC
 
 def trim_vertical_whitespace(ink, xr, top, bot, max_gap_pt=None):
-    """
-    প্রশ্নের উপরের ও নিচের সাদা অংশ ছাঁটাই করে।
-    যদি প্রশ্নের নিচে উত্তর লেখার জন্য বড় ফাঁকা জায়গা (max_gap_pt এর বেশি) থাকে,
-    তবে খাড়া বর্ডার বা টানা দাগ উপেক্ষা করে ঠিক লেখার নিচেই বক্স থামিয়ে দেয়।
-    """
     if max_gap_pt is None:
         max_gap_pt = float(MAX_BLANK_GAP_PT)
 
@@ -589,10 +570,8 @@ def trim_vertical_whitespace(ink, xr, top, bot, max_gap_pt=None):
         return top, bot
 
     roi = ink[y0:y1, x0:x1].astype(np.uint8)
-    # পাশের খাড়া মার্জিন বা বক্সের বর্ডার মুছে ফেলা
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(14, int(18 * SC))))
     v_lines = cv2.morphologyEx(roi, cv2.MORPH_OPEN, v_kernel)
-    # উত্তর লেখার জন্য টানা লম্বা অনুভূমিক দাগ থাকলে তা উপেক্ষা করা
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(25, int((x1 - x0) * 0.48)), 1))
     h_lines = cv2.morphologyEx(roi, cv2.MORPH_OPEN, h_kernel)
     clean_roi = roi & (~v_lines) & (~h_lines)
@@ -615,8 +594,208 @@ def trim_vertical_whitespace(ink, xr, top, bot, max_gap_pt=None):
     return max(top, (y0 + first_row) / SC - 3.5), min(bot, (y0 + last_row) / SC + 5.0)
 
 # ==============================================================================
-# ৭. ৩-পাস শক্তিশালী OCR ইঞ্জিন ও মার্কার বিশ্লেষণ
+# ৭. ভিশন ও ডিওয়ার্পিং ইঞ্জিন (বাঁকা পাতা সোজা করা + র‍্যানস্যাক মার্জিন + সিকোয়েন্স রিকভারি)
 # ==============================================================================
+def _best_local_tilt_angle(ink_seg, rng=5.5, step=0.25):
+    if ink_seg.size == 0 or ink_seg.sum() < 150:
+        return 0.0
+    small = cv2.resize(ink_seg.astype(np.float32), None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    sh, sw = small.shape[:2]
+    center = (sw * 0.5, sh * 0.5)
+    best_score, best_ang = -1.0, 0.0
+    for ang in np.arange(-rng, rng + 1e-6, step):
+        M = cv2.getRotationMatrix2D(center, float(ang), 1.0)
+        rot = cv2.warpAffine(small, M, (sw, sh))
+        proj = rot.sum(axis=1)
+        sc = float(np.sum(np.diff(proj) ** 2))
+        if sc > best_score:
+            best_score, best_ang = sc, float(ang)
+    return best_ang
+
+def _dewarp_column_arrays(norm_col, clean_ink_col, raw_ink_col):
+    """কলামের বাঁকা বা ঢেউ খেলানো লাইনগুলোকে অনুভূমিকভাবে সোজা করে।"""
+    H_c, W_c = clean_ink_col.shape[:2]
+    win = max(120, int(150 * SC))
+    step = max(60, int(75 * SC))
+    ys = sorted(set(list(range(0, max(1, H_c - win), step)) + [max(0, H_c - win)]))
+    centers, angles = [], []
+    for y0 in ys:
+        seg = clean_ink_col[y0:min(H_c, y0 + win), :]
+        ang = _best_local_tilt_angle(seg)
+        centers.append(y0 + win * 0.5)
+        angles.append(np.deg2rad(ang))
+    angles = np.array(angles, dtype=np.float32)
+    if len(angles) >= 3:
+        angles = np.array([np.median(angles[max(0, i - 1):i + 2]) for i in range(len(angles))], dtype=np.float32)
+    thy = np.interp(np.arange(H_c, dtype=np.float32), centers, angles).astype(np.float32)
+    xc = W_c * 0.5
+    xx = np.tile(np.arange(W_c, dtype=np.float32), (H_c, 1))
+    yy = np.tile(np.arange(H_c, dtype=np.float32)[:, None], (1, W_c))
+    map_y = (yy + thy[:, None] * (xx - xc)).astype(np.float32)
+
+    n_dew = cv2.remap(norm_col, xx, map_y, cv2.INTER_LINEAR, borderValue=255)
+    c_dew = (cv2.remap(clean_ink_col, xx, map_y, cv2.INTER_NEAREST, borderValue=0) > 0).astype(np.uint8)
+    r_dew = (cv2.remap(raw_ink_col, xx, map_y, cv2.INTER_NEAREST, borderValue=0) > 0).astype(np.uint8)
+    return n_dew, c_dew, r_dew, thy
+
+def _detect_header_bottom_px(raw_ink_col):
+    """কলামের উপরের হেডার লাইনের নিচের সীমানা বের করে।"""
+    H_c, W_c = raw_ink_col.shape[:2]
+    joined = cv2.dilate(raw_ink_col, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(3.5 * SC)), 1)))
+    min_w = max(30, int(W_c * 0.42))
+    h_rule = cv2.morphologyEx(joined, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (min_w, 1)))
+    thick = cv2.morphologyEx(joined, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (min_w, max(4, int(2.5 * SC)))))
+    thin_rule = h_rule & (thick == 0).astype(np.uint8)
+    rows = np.where(thin_rule[:int(H_c * 0.16)].sum(axis=1) > 0)[0]
+    if len(rows) > 0:
+        return int(rows.max()) + int(3.0 * SC)
+    return int(36.0 * SC)
+
+def _horizontal_line_bands(ink_col, y_start, y_end, min_h_px):
+    sub = ink_col[y_start:y_end, :]
+    prof = sub.sum(axis=1)
+    thr = max(2, int(0.004 * ink_col.shape[1]))
+    on = prof > thr
+    raw_bands = []
+    s = None
+    for i, v in enumerate(on):
+        if v and s is None:
+            s = i
+        elif not v and s is not None:
+            if (i - s) >= min_h_px:
+                raw_bands.append((s + y_start, i + y_start))
+            s = None
+    if s is not None and (y_end - y_start - s) >= min_h_px:
+        raw_bands.append((s + y_start, y_end))
+
+    if not raw_bands:
+        return []
+
+    hs = sorted(b - a for a, b in raw_bands)
+    med_h = max(int(8.0 * SC), hs[len(hs) // 2])
+    final_bands = []
+    for a, b in raw_bands:
+        if (b - a) > 1.85 * med_h:
+            seg = ink_col[a:b, :].sum(axis=1).astype(float)
+            smooth = np.convolve(seg, np.ones(5) / 5.0, mode="same")
+            mx = smooth.max()
+            cuts = []
+            step_w = max(6, int(med_h * 0.6))
+            idx_c = step_w
+            while idx_c < len(smooth) - step_w:
+                win = smooth[max(0, idx_c - 2):idx_c + 3]
+                if win.min() < 0.20 * mx and smooth[max(0, idx_c - step_w):idx_c].max() > 0.38 * mx and smooth[idx_c:idx_c + step_w].max() > 0.38 * mx:
+                    cuts.append(idx_c)
+                    idx_c += int(med_h * 0.75)
+                else:
+                    idx_c += 1
+            pts = [0] + cuts + [len(smooth)]
+            for j in range(len(pts) - 1):
+                if (pts[j + 1] - pts[j]) >= min_h_px:
+                    final_bands.append((a + pts[j], a + pts[j + 1]))
+        else:
+            final_bands.append((a, b))
+    return final_bands
+
+def _first_token_span(ink_col, y0, y1, gap_px):
+    cols = ink_col[y0:y1, :].sum(axis=0) > 0
+    xs = np.where(cols)[0]
+    if len(xs) == 0:
+        return None
+    s = int(xs[0])
+    e = s
+    for x in xs[1:]:
+        if int(x) - e > gap_px:
+            break
+        e = int(x)
+    return s, e, int(xs[-1])
+
+def _fit_slanted_margin_ransac(line_items):
+    """
+    র‍্যানস্যাক (RANSAC) পদ্ধতিতে কলামের প্রকৃত ঢালু বাম মার্জিন রেখা (x = a*y + b) বের করে।
+    বাম দিকের আউটলায়ারকে ৩ গুণ পেনাল্টি দেয় যাতে ইনডেন্টেড অপশন সারি মার্জিনকে ডানে টেনে না নেয়।
+    """
+    if len(line_items) < 4:
+        b_def = float(min((it["x0"] for it in line_items), default=0.0))
+        return 0.0, b_def, lambda _y, b=b_def: b
+
+    pts = np.array([[0.5 * (it["y0"] + it["y1"]), float(it["x0"])] for it in line_items], dtype=float)
+    tol = max(4.0, 3.8 * SC)
+    rnd = random.Random(42)
+    best = None
+    min_dy = max(40.0, 55.0 * SC)
+
+    for _ in range(450):
+        i, j = rnd.sample(range(len(pts)), 2)
+        if abs(pts[j, 0] - pts[i, 0]) < min_dy:
+            continue
+        a = (pts[j, 1] - pts[i, 1]) / (pts[j, 0] - pts[i, 0])
+        if abs(a) > 0.09:
+            continue
+        b = pts[i, 1] - a * pts[i, 0]
+        res = pts[:, 1] - (a * pts[:, 0] + b)
+        inliers = int((np.abs(res) <= tol).sum())
+        left_outliers = int((res < -tol).sum())
+        score = inliers - 3 * left_outliers
+        if best is None or score > best[0]:
+            best = (score, float(a), float(b))
+
+    if best is None:
+        b_def = float(np.percentile(pts[:, 1], 12))
+        return 0.0, b_def, lambda _y, b=b_def: b
+
+    _, a, b = best
+    res = pts[:, 1] - (a * pts[:, 0] + b)
+    mask = np.abs(res) <= tol
+    if int(mask.sum()) >= 3:
+        a_ref, b_ref = np.polyfit(pts[mask, 0], pts[mask, 1], 1)
+        a, b = float(a_ref), float(b_ref)
+    return a, b, lambda y, a=a, b=b: float(a * float(y) + b)
+
+def _ocr_digits_voting(strip_gray, y0, y1, x_start):
+    """মার্জিনের ছোট নম্বর ক্রপে একাধিক প্রস্থ ও থ্রেশহোল্ড চালিয়ে ভোটিং ওসিআর করে।"""
+    if pytesseract is None:
+        return None
+    votes = {}
+    widths_px = [int(w * SC) for w in (11, 13, 15, 17, 19, 22)]
+    pad_y = max(2, int(1.5 * SC))
+    pad_x = max(2, int(1.8 * SC))
+
+    for w_px in widths_px:
+        crop = strip_gray[max(0, y0 - pad_y):min(strip_gray.shape[0], y1 + pad_y), max(0, x_start - pad_x):min(strip_gray.shape[1], x_start + w_px)]
+        if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
+            continue
+        up = cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        bordered = cv2.copyMakeBorder(up, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+        _, otsu = cv2.threshold(bordered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        eroded = cv2.erode(otsu, np.ones((2, 2), np.uint8))
+
+        for variant in (bordered, otsu, eroded):
+            for psm in (7, 8):
+                try:
+                    d = pytesseract.image_to_data(
+                        variant,
+                        config=f"--psm {psm} -c tessedit_char_whitelist=0123456789.",
+                        output_type=pytesseract.Output.DICT
+                    )
+                    for txt, cf in zip(d["text"], d["conf"]):
+                        t = txt.strip()
+                        c_val = int(cf) if str(cf).lstrip("-").isdigit() else -1
+                        if not t or c_val < 25:
+                            continue
+                        m = re.fullmatch(r"(\d{1,3})(\.?)", t)
+                        if m and (m.group(2) or len(m.group(1)) >= 2):
+                            qn = int(m.group(1))
+                            if 1 <= qn <= MAX_Q_NUMBER:
+                                weight = c_val + (18 if m.group(2) else 0) + 10 * (len(m.group(1)) - 1)
+                                votes[qn] = votes.get(qn, 0) + weight
+                except Exception:
+                    pass
+    if not votes:
+        return None
+    best_q = max(votes, key=votes.get)
+    return best_q, votes[best_q]
+
 def group_words_into_lines(words):
     if not words:
         return []
@@ -638,290 +817,345 @@ def group_words_into_lines(words):
     lines.append(cur_line)
     return lines
 
-def _parse_paddle_raw_result(raw_res):
-    """PaddleOCR v2 এবং v3 উভয় সংস্করণের আউটপুট থেকে (poly, text, score) আলাদা করে।"""
-    parsed = []
-    if not raw_res:
-        return parsed
+def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xray_logs=None):
+    """
+    বাঁকা বা সোজা যেকোনো পিডিএফ পাতার জন্য সম্পূর্ণ সমন্বিত পাইপলাইন:
+    ১. ঢালু কলাম ডিভাইডার ও কলাম ডিওয়ার্পিং।
+    ২. র‍্যানস্যাক ঢালু বাম মার্জিন ও মার্জিন স্ট্রিপ এক্সট্রাকশন।
+    ৩. প্রথম টোকেনের প্রস্থ (সংখ্যা বনাম 'উত্তর:'/'ব্যাখ্যা:'), অপশন বৃত্ত, সিকোয়েন্স রিকভারি
+       এবং নলেজ-বেস ট্যাগের সমন্বয়ে প্রতিটি প্রশ্নের নিখুঁত বক্স নির্ণয়।
+    """
+    norm_gray = normalize_shadow_gray(gray_img)
+    raw_ink = get_ink_mask(gray_img).astype(np.uint8)
+    h_px, w_px = gray_img.shape[:2]
 
-    for page_item in raw_res:
-        if page_item is None:
-            continue
-        if isinstance(page_item, dict) or hasattr(page_item, "keys"):
-            d = page_item if isinstance(page_item, dict) else dict(page_item)
-            texts = d.get("rec_texts", [])
-            scores = d.get("rec_scores", [])
-            polys = d.get("dt_polys", d.get("rec_polys", d.get("rec_boxes", [])))
-            for idx, txt in enumerate(texts):
-                sc_val = float(scores[idx]) if idx < len(scores) else 0.9
-                poly = polys[idx] if idx < len(polys) else None
-                if poly is not None and str(txt).strip():
-                    parsed.append((poly, str(txt).strip(), sc_val))
+    div_x_pt, is_two_col, div_slope, div_fn = trace_slanted_divider(gray_img, W, H)
+
+    # যদি ডিভাইডার ঢালু হয় তবে পুরো পৃষ্ঠাকে সামান্য শিয়ার করে সোজা করে নেওয়া
+    if is_two_col and abs(div_slope) > 0.002:
+        M_shear = np.float32([[1.0, -div_slope, 0.0], [0.0, 1.0, 0.0]])
+        norm_s = cv2.warpAffine(norm_gray, M_shear, (w_px, h_px), borderValue=255)
+        ink_s = cv2.warpAffine(raw_ink, M_shear, (w_px, h_px), borderValue=0)
+        div_px = int(round(div_fn(0.0) * SC))
+    else:
+        norm_s = norm_gray.copy()
+        ink_s = raw_ink.copy()
+        div_px = int(round(div_x_pt * SC))
+
+    # খাড়া ডিভাইডার ও লম্বা অনুভূমিক দাগ পরিষ্কার করা
+    v_div = cv2.morphologyEx(ink_s, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, int(h_px * 0.10)))))
+    clean_s = ink_s & (cv2.dilate(v_div, np.ones((1, 5), np.uint8)) == 0).astype(np.uint8)
+    j_h = cv2.dilate(ink_s, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(3.0 * SC)), 1)))
+    hr = cv2.morphologyEx(j_h, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (int(w_px * 0.16), 1)))
+    thick_hr = cv2.morphologyEx(j_h, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (int(w_px * 0.16), max(4, int(2.5 * SC)))))
+    hr = hr & (thick_hr == 0).astype(np.uint8)
+    clean_s = clean_s & (cv2.dilate(hr, np.ones((3, 1), np.uint8)) == 0).astype(np.uint8)
+
+    margin_edge_px = int(12.0 * SC)
+    if is_two_col:
+        col_px_ranges = [(margin_edge_px, max(margin_edge_px + 50, div_px - 3)), (min(w_px - 50, div_px + 3), w_px - margin_edge_px)]
+    else:
+        col_px_ranges = [(margin_edge_px, w_px - margin_edge_px)]
+
+    # পিডিএফে ডিজিটাল টেক্সট লেয়ার থাকলে তার শব্দগুলো নেওয়া
+    pdf_words = [(w[0], w[1], w[2], w[3], w[4].strip()) for w in page.get_text("words") if w[4].strip()]
+    pdf_lines_all = group_words_into_lines(pdf_words)
+
+    col_data_list = []
+    all_markers = []
+    min_band_h = max(5, int(3.4 * SC))
+    tok_gap_px = max(4, int(3.6 * SC))
+
+    for ci, (cx0_px, cx1_px) in enumerate(col_px_ranges):
+        n_col = norm_s[:, cx0_px:cx1_px].copy()
+        c_col = clean_s[:, cx0_px:cx1_px].copy()
+        r_col = ink_s[:, cx0_px:cx1_px].copy()
+
+        # কলামের ডান প্রান্তের কালো বর্ডার থাকলে তা মুছে ফেলা
+        if (not is_two_col or ci == 1) and c_col.shape[1] > int(20 * SC):
+            c_col[:, -int(10 * SC):] = 0
+
+        # কলামের বাঁকা লাইনগুলো সোজা (Dewarp) করা
+        n_dew, c_dew, r_dew, thy = _dewarp_column_arrays(n_col, c_col, r_col)
+        hdr_px = _detect_header_bottom_px(r_dew)
+        c_dew[:hdr_px, :] = 0
+
+        # র‍্যানস্যাক মার্জিন বের করার জন্য কলামের সব লাইন শনাক্ত করা
+        raw_lines = []
+        for y0, y1 in _horizontal_line_bands(c_dew, hdr_px, h_px - int(24 * SC), min_band_h):
+            sp = _first_token_span(c_dew, y0, y1, tok_gap_px)
+            if sp is not None:
+                raw_lines.append({"y0": y0, "y1": y1, "x0": sp[0], "ft_end": sp[1], "x1": sp[2]})
+
+        if not raw_lines:
             continue
 
-        if isinstance(page_item, (list, tuple)):
-            if (
-                len(page_item) == 2
-                and isinstance(page_item[1], (list, tuple))
-                and len(page_item[1]) >= 2
-                and isinstance(page_item[1][0], str)
-            ):
-                parsed.append((page_item[0], page_item[1][0].strip(), float(page_item[1][1])))
+        _, _, mx_fn = _fit_slanted_margin_ransac(raw_lines)
+
+        # ঢালু মার্জিন বরাবর স্ট্রিপ কেটে নেওয়া (বামে ৩ পয়েন্ট থেকে ডানে ৩২ পয়েন্ট পর্যন্ত)
+        x_lo, x_hi = -int(3.2 * SC), int(32.0 * SC)
+        strip_w = x_hi - x_lo
+        Si = np.zeros((h_px, strip_w), dtype=np.uint8)
+        Sg = np.full((h_px, strip_w), 255, dtype=np.uint8)
+        Hc, Wc = c_dew.shape[:2]
+        for y_r in range(Hc):
+            a_x = int(round(mx_fn(y_r))) + x_lo
+            s_x = max(0, a_x)
+            e_x = min(Wc, a_x + strip_w)
+            if e_x > s_x:
+                Si[y_r, s_x - a_x:e_x - a_x] = c_dew[y_r, s_x:e_x]
+                Sg[y_r, s_x - a_x:e_x - a_x] = n_dew[y_r, s_x:e_x]
+        Si[:hdr_px, :] = 0
+
+        # স্ট্রিপের ভেতর থেকে মার্জিন মার্কারগুলো (প্রশ্ন নম্বর বনাম 'উত্তর:'/'ব্যাখ্যা:') আলাদা করা
+        col_markers = []
+        max_lead_px = int(8.5 * SC)
+        max_num_tw_px = int(19.5 * SC)
+
+        for y0, y1 in _horizontal_line_bands(Si, hdr_px, h_px - int(22 * SC), min_band_h):
+            xs = np.where(Si[y0:y1, :].sum(axis=0) > 0)[0]
+            if len(xs) == 0:
+                continue
+            if int(xs[0]) > max_lead_px:
+                # এটি মার্জিন থেকে ডানে সরে থাকা ইনডেন্টেড লাইন (যেমন অপশন সারি)
+                continue
+
+            sp = _first_token_span(Si, y0, y1, tok_gap_px)
+            if sp is None:
+                continue
+            tw = sp[1] - sp[0] + 1
+
+            # পুরো কলামে ওই লাইনের প্রশস্ততা ও অপশন বৃত্ত চেক করা
+            full_xs = np.where(c_dew[y0:y1, :].sum(axis=0) > 0)[0]
+            line_span_px = (int(full_xs[-1]) - int(full_xs[0])) if len(full_xs) > 0 else tw
+
+            # পিডিএফ টেক্সট লেয়ারে ওই স্থানে কোনো সমাধান ট্যাগ বা প্রশ্ন ট্যাগ আছে কি না
+            y0_pt, y1_pt = y0 / SC, y1 / SC
+            cx0_pt, cx1_pt = cx0_px / SC, cx1_px / SC
+            matching_pdf_ln = [
+                ln for ln in pdf_lines_all
+                if ln and cx0_pt - 4 <= ln[0][0] <= cx1_pt + 4 and abs(ln[0][1] - y0_pt) <= 8.0
+            ]
+            pdf_line_txt = " ".join(w[4] for ln in matching_pdf_ln for w in ln).strip()
+
+            if pdf_line_txt and HEADER_NOISE_RE.search(pdf_line_txt):
+                continue
+
+            # যদি পিডিএফ টেক্সট লেয়ারে বা টোকেন প্রস্থে স্পষ্ট সমাধান ট্যাগ থাকে
+            is_sol_by_tag = False
+            if matching_pdf_ln:
+                is_sol_by_tag, _ = line_has_solution_marker(matching_pdf_ln[0], pdf_line_txt, cx0_pt + MAX_SOL_X_OFFSET)
+
+            if is_sol_by_tag:
+                col_markers.append({
+                    "col": ci, "y0": y0, "y1": y1, "tw": tw,
+                    "kind": "label", "num": None, "conf": 100, "guessed": False
+                })
+                continue
+
+            # ওসিআর দিয়ে সংখ্যা পড়ার চেষ্টা
+            read_res = _ocr_digits_voting(Sg, y0, y1, sp[0]) if tw <= int(24.0 * SC) else None
+
+            # যদি পিডিএফ টেক্সট লেয়ারে প্রশ্ন নম্বর থাকে
+            if read_res is None and matching_pdf_ln:
+                t0_pdf = matching_pdf_ln[0][0][4].strip("([{|! ")
+                m_p = NUM_RE.match(t0_pdf)
+                if m_p:
+                    qn_p = _b2e_int(m_p.group(1))
+                    if qn_p is not None and 1 <= qn_p <= MAX_Q_NUMBER:
+                        read_res = (qn_p, 120)
+
+            if read_res is not None:
+                col_markers.append({
+                    "col": ci, "y0": y0, "y1": y1, "tw": tw,
+                    "kind": "num", "num": read_res[0], "conf": read_res[1], "guessed": False
+                })
+            elif tw <= max_num_tw_px and line_span_px >= int(42.0 * SC):
+                # প্রস্থ একদম প্রশ্ন নম্বরের মতো ছোট (যেমন '11.' বা '15.'), কিন্তু ওসিআর মিস করেছে -> সিকোয়েন্স রিকভারির জন্য 'cand'
+                col_markers.append({
+                    "col": ci, "y0": y0, "y1": y1, "tw": tw,
+                    "kind": "cand", "num": None, "conf": 0, "guessed": False
+                })
             else:
-                for line_item in page_item:
-                    if (
-                        isinstance(line_item, (list, tuple))
-                        and len(line_item) == 2
-                        and isinstance(line_item[1], (list, tuple))
-                        and len(line_item[1]) >= 2
-                    ):
-                        parsed.append((line_item[0], str(line_item[1][0]).strip(), float(line_item[1][1])))
-    return parsed
+                # চওড়া মার্জিন টোকেন (যেমন 'উত্তর:', 'ব্যাখ্যা:', 'সমাধান:', 'বিকল্প:') -> 'label'
+                col_markers.append({
+                    "col": ci, "y0": y0, "y1": y1, "tw": tw,
+                    "kind": "label", "num": None, "conf": 0, "guessed": False
+                })
 
+        col_data_list.append({
+            "ci": ci, "cx0_px": cx0_px, "cx1_px": cx1_px,
+            "n_dew": n_dew, "c_dew": c_dew, "thy": thy,
+            "mx_fn": mx_fn, "markers": col_markers
+        })
+        all_markers.extend(col_markers)
 
-def run_paddle_ocr_words(gray_roi, base_x, base_y, scale, min_y=12.0, max_y=9999.0):
-    """প্যাডেল-ওসিআর চালিয়ে প্রতিটি শব্দকে (wx0, wy0, wx1, wy1, text) ফরম্যাটে রূপান্তর করে।"""
-    engine = get_paddle_ocr_engine()
-    if engine is None or gray_roi is None or gray_roi.size == 0:
+    if not all_markers:
         return []
 
-    if len(gray_roi.shape) == 2:
-        img_bgr = cv2.cvtColor(gray_roi, cv2.COLOR_GRAY2BGR)
+    # ==========================================================================
+    # সিকোয়েন্স ফিল্টার ও মিসিং প্রশ্ন নম্বর রিকভারি (Sequence Recovery)
+    # ==========================================================================
+    all_markers.sort(key=lambda m: (m["col"], m["y0"]))
+    numbered = [m for m in all_markers if m["kind"] == "num" and m["num"] is not None]
+
+    if numbered:
+        # দীর্ঘতম ক্রমবর্ধমান প্রশ্ন নম্বরের চেইন (Longest Increasing Subsequence) বের করা
+        n_len = len(numbered)
+        dp = [(1, -1)] * n_len
+        for i in range(n_len):
+            for j in range(i):
+                diff = numbered[i]["num"] - numbered[j]["num"]
+                if 1 <= diff <= 5 and (dp[j][0] + 1) > dp[i][0]:
+                    dp[i] = (dp[j][0] + 1, j)
+        best_end = max(range(n_len), key=lambda k: dp[k][0])
+        chain_ids = set()
+        cur_k = best_end
+        while cur_k != -1:
+            chain_ids.add(id(numbered[cur_k]))
+            cur_k = dp[cur_k][1]
+
+        for m in numbered:
+            if id(m) not in chain_ids:
+                m["kind"] = "cand" if m["tw"] <= int(19.5 * SC) else "label"
+                m["num"] = None
+
+        kept = [m for m in all_markers if m["kind"] == "num"]
+
+        # ১. দুটি শনাক্ত হওয়া প্রশ্নের মাঝখানে কোনো নম্বর মিস হলে (যেমন 13 এবং 15 এর মাঝে 14) তা 'cand' থেকে পূরণ করা
+        for a_m, b_m in zip(kept, kept[1:]):
+            miss = list(range(a_m["num"] + 1, b_m["num"]))
+            if not miss:
+                continue
+            pool = [
+                m for m in all_markers
+                if m["kind"] == "cand" and (a_m["col"], a_m["y0"]) < (m["col"], m["y0"]) < (b_m["col"], b_m["y0"])
+            ]
+            for k_num, m_cand in zip(miss, pool[:len(miss)]):
+                m_cand["kind"] = "num"
+                m_cand["num"] = k_num
+                m_cand["guessed"] = True
+
+        # ২. প্রথম শনাক্ত হওয়া প্রশ্নের আগে কোনো 'cand' থাকলে (যেমন 12 এর আগে 11) তা পূরণ করা
+        first_m = kept[0]
+        lead_cands = [
+            m for m in all_markers
+            if m["kind"] == "cand"
+            and (m["col"], m["y0"]) < (first_m["col"], first_m["y0"])
+            and any(x["kind"] == "label" and (m["col"], m["y0"]) < (x["col"], x["y0"]) < (first_m["col"], first_m["y0"]) for x in all_markers)
+        ]
+        for k_num, m_cand in zip(range(first_m["num"] - 1, 0, -1), reversed(lead_cands)):
+            m_cand["kind"] = "num"
+            m_cand["num"] = k_num
+            m_cand["guessed"] = True
+
+        # ৩. শেষ শনাক্ত হওয়া প্রশ্নের পরে কোনো 'cand' থাকলে (যেমন 14 এর পরে 15) তা পূরণ করা
+        kept = [m for m in all_markers if m["kind"] == "num"]
+        last_m = kept[-1]
+        tail_cands = [
+            m for m in all_markers
+            if m["kind"] == "cand"
+            and (m["col"], m["y0"]) > (last_m["col"], last_m["y0"])
+            and any(x["kind"] == "label" and (x["col"], x["y0"]) > (m["col"], m["y0"]) and x["col"] == m["col"] for x in all_markers)
+        ]
+        for k_num, m_cand in zip(range(last_m["num"] + 1, MAX_Q_NUMBER + 1), tail_cands):
+            m_cand["kind"] = "num"
+            m_cand["num"] = k_num
+            m_cand["guessed"] = True
     else:
-        img_bgr = gray_roi
+        # যদি ওসিআর অনুপস্থিত থাকে, তবে যেসব 'cand'-এর নিচে অপশন ও পরে 'label' ('উত্তর:') আছে সেগুলোকে প্রশ্ন হিসেবে নেওয়া
+        for idx_m, m in enumerate(all_markers):
+            if m["kind"] == "cand":
+                nxt_in_col = [x for x in all_markers[idx_m + 1:] if x["col"] == m["col"]]
+                if nxt_in_col and nxt_in_col[0]["kind"] == "label":
+                    m["kind"] = "num"
+                    m["guessed"] = True
 
-    raw_res = None
-    for call_fn in (
-        lambda: engine.ocr(img_bgr, cls=True),
-        lambda: engine.ocr(img_bgr),
-        lambda: list(engine.predict(img_bgr)),
-    ):
-        try:
-            raw_res = call_fn()
-            break
-        except Exception:
-            continue
+    # ==========================================================================
+    # প্রতিটি প্রশ্নের শুরু থেকে 'উত্তর:'/'ব্যাখ্যা:' লেবেলের ঠিক আগ পর্যন্ত বক্স তৈরি
+    # ==========================================================================
+    page_rects = []
+    for c_info in col_data_list:
+        ci = c_info["ci"]
+        cx0_px = c_info["cx0_px"]
+        c_dew = c_info["c_dew"]
+        thy = c_info["thy"]
+        Hc, Wc = c_dew.shape[:2]
 
-    items = _parse_paddle_raw_result(raw_res)
-    words_out = []
+        c_markers = sorted([m for m in all_markers if m["col"] == ci], key=lambda x: x["y0"])
+        q_markers = [m for m in c_markers if m["kind"] == "num"]
 
-    for poly, txt, conf in items:
-        if not txt or conf < 0.18:
-            continue
-        try:
-            arr = np.array(poly, dtype=float)
-            if arr.ndim == 1 and arr.size == 4:
-                px0, py0, px1, py1 = float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
-            else:
-                pts = arr.reshape(-1, 2)
-                px0, py0 = float(pts[:, 0].min()), float(pts[:, 1].min())
-                px1, py1 = float(pts[:, 0].max()), float(pts[:, 1].max())
-        except Exception:
-            continue
+        for qm in q_markers:
+            # এই প্রশ্নের নিচে প্রথম যে 'label' ('উত্তর:' বা 'ব্যাখ্যা:') বা পরবর্তী প্রশ্ন আছে, তার ঠিক উপরেই বক্স থামবে
+            after_m = [m for m in c_markers if m["y0"] > qm["y0"] + int(4.0 * SC)]
+            stop_y_px = after_m[0]["y0"] - int(2.0 * SC) if after_m else (Hc - int(15.0 * SC))
 
-        line_x0 = base_x + (px0 / scale)
-        line_y0 = base_y + (py0 / scale)
-        line_x1 = base_x + (px1 / scale)
-        line_y1 = base_y + (py1 / scale)
+            # বাঁকা পাতার কোণায় যদি ৪র্থ অপশনটি 'উত্তর:' লেবেলের চেয়ে সামান্য নিচে নেমে গিয়ে থাকে (যেমন Q27), তবে ডান পাশের কালি দেখে তা রক্ষা করা
+            if after_m and after_m[0]["kind"] == "label":
+                lb = after_m[0]
+                right_zone_x0 = int(Wc * 0.55)
+                lim_y = min(Hc - 1, lb["y1"] + int(5.0 * SC))
+                if lim_y > stop_y_px:
+                    row_ink_right = c_dew[stop_y_px:lim_y, right_zone_x0:Wc].sum(axis=1) > 0
+                    if int(row_ink_right.sum()) > 2:
+                        last_r = 0
+                        blank_run = 0
+                        for r_i, has_v in enumerate(row_ink_right):
+                            if has_v:
+                                last_r = r_i
+                                blank_run = 0
+                            else:
+                                blank_run += 1
+                                if blank_run >= 4 and r_i > (lb["y1"] - stop_y_px):
+                                    break
+                        stop_y_px = min(Hc - 1, stop_y_px + last_r + int(2.0 * SC))
 
-        if not (min_y < line_y0 < max_y):
-            continue
-
-        tokens = [t for t in txt.split() if t]
-        if not tokens:
-            continue
-
-        total_w = max(4.0, line_x1 - line_x0)
-        char_lens = [max(1, len(t)) for t in tokens]
-        total_chars = sum(char_lens)
-        cur_x = line_x0
-        for tok, c_len in zip(tokens, char_lens):
-            w_span = total_w * (c_len / total_chars)
-            words_out.append((cur_x, line_y0, cur_x + w_span, line_y1, tok))
-            cur_x += w_span
-
-    return words_out
-
-
-def get_column_lines(page, gray_img, x0, x1, H, col_i=0, is_two_col=True, div_fn=None):
-    pdf_words = []
-    for wx0, wy0, wx1, wy1, text, *_ in page.get_text("words"):
-        if x0 - 4 <= wx0 < x1 - 4 and 12 < wy0 < H - 18:
-            pdf_words.append((wx0, wy0, wx1, wy1, text.strip()))
-
-    pdf_lines = group_words_into_lines(pdf_words)
-    sol_in_pdf = sum(1 for l in pdf_lines if line_has_solution_marker(l, " ".join(w[4] for w in l), x0 + MAX_SOL_X_OFFSET)[0])
-    q_in_pdf = sum(1 for w in pdf_words if NUM_RE.match(w[4]) or PURE_PREFIX_RE.match(w[4]))
-
-    ocr_words = []
-    ocr_thin_words = []
-    ocr_eng_words = []
-
-    if q_in_pdf < 3 or sol_in_pdf < max(1, q_in_pdf):
-        x0_px, x1_px = max(0, int(x0 * SC)), min(gray_img.shape[1], int(x1 * SC))
-        roi_gray = normalize_shadow_gray(gray_img[:, x0_px:x1_px].copy())
-
-        if is_two_col and div_fn is not None:
-            for r_px in range(roi_gray.shape[0]):
-                d_px = int(div_fn(r_px / SC) * SC) - x0_px
-                if col_i == 1 and 0 <= d_px + 4 < roi_gray.shape[1]:
-                    roi_gray[r_px, :max(0, d_px + 4)] = 255
-                elif col_i == 0 and 0 <= d_px - 4 < roi_gray.shape[1]:
-                    roi_gray[r_px, max(0, d_px - 4):] = 255
-
-        if (not is_two_col or col_i == 1) and roi_gray.shape[1] > int(25 * SC):
-            roi_gray[:, -int(12 * SC):] = 255
-
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(roi_gray)
-        base_x = x0_px / SC
-
-        # পাস ১: প্রধান PaddleOCR ডিপ লার্নিং স্ক্যান
-        ocr_words = run_paddle_ocr_words(clahe, base_x=base_x, base_y=0.0, scale=SC, min_y=12.0, max_y=H - 18.0)
-
-        # পাস ২: বাম পাশের মার্জিন স্ট্রিপে PaddleOCR স্ক্যান (প্রশ্ন নম্বর ও Soln ট্যাগ আরও নিখুঁতভাবে ধরতে)
-        left_strip_w = min(clahe.shape[1], int(115 * SC))
-        ocr_eng_words = run_paddle_ocr_words(clahe[:, :left_strip_w], base_x=base_x, base_y=0.0, scale=SC, min_y=12.0, max_y=H - 18.0)
-
-        # পাস ৩ (ঐচ্ছিক ফলব্যাক): যদি পিসিতে বা ক্লাউডে Tesseract থাকে, তবে বাংলা শব্দের জন্য সহায়ক পাস
-        if pytesseract is not None:
-            try:
-                clean_bw = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 14)
-                ocr_data2 = pytesseract.image_to_data(
-                    clean_bw, lang="ben+eng", config="--psm 6", output_type=pytesseract.Output.DICT
-                )
-                for i in range(len(ocr_data2["text"])):
-                    txt = ocr_data2["text"][i].strip()
-                    conf = int(ocr_data2["conf"][i]) if str(ocr_data2["conf"][i]).lstrip("-").isdigit() else -1
-                    if not txt or conf < 18:
-                        continue
-                    wx0 = base_x + ocr_data2["left"][i] / SC
-                    wy0 = ocr_data2["top"][i] / SC
-                    wx1 = wx0 + ocr_data2["width"][i] / SC
-                    wy1 = wy0 + ocr_data2["height"][i] / SC
-                    if 12 < wy0 < H - 18:
-                        ocr_thin_words.append((wx0, wy0, wx1, wy1, txt))
-            except Exception:
-                pass
-
-    return (
-        pdf_lines,
-        group_words_into_lines(ocr_words),
-        group_words_into_lines(ocr_thin_words),
-        group_words_into_lines(ocr_eng_words),
-    )
-
-def analyze_lines_for_markers(lines, actual_left_x, div_slope=0.0, H=842.0, xray_log=None, page_no=1, col_no=1):
-    starts, stops = [], []
-    if not lines:
-        return starts, stops
-
-    norm_x0s = [line[0][0] - div_slope * (line[0][1] - H * 0.5) for line in lines if line and len(line[0][4]) >= 2]
-    text_left_x = float(np.percentile(norm_x0s, 15)) if norm_x0s else actual_left_x
-
-    for line in lines:
-        first_w = line[0]
-        wx0, wy0, wx1, wy1, t0 = first_w
-        joined_text = " ".join(w[4] for w in line).strip()
-        if not joined_text:
-            continue
-
-        if HEADER_NOISE_RE.search(joined_text):
-            if xray_log is not None:
-                xray_log.append({"পৃষ্ঠা": page_no, "কলাম": col_no, "Y": round(wy0, 1), "সিদ্ধান্ত": "বাতিল (হেডার নয়েজ)", "লাইন": joined_text[:70]})
-            continue
-
-        local_shift = div_slope * (wy0 - H * 0.5)
-        max_q_x = max(actual_left_x + MAX_Q_X_OFFSET, text_left_x + local_shift + (MAX_Q_X_OFFSET - 10.0))
-        max_sol_x = max(actual_left_x + MAX_SOL_X_OFFSET, text_left_x + local_shift + (MAX_SOL_X_OFFSET - 12.0))
-
-        if BULLET_STOP_RE.match(t0) or BULLET_STOP_RE.match(joined_text):
-            stops.append(wy0 - 1.0)
-            if xray_log is not None:
-                xray_log.append({"পৃষ্ঠা": page_no, "কলাম": col_no, "Y": round(wy0, 1), "সিদ্ধান্ত": "থামো (বুলেট চিহ্ন)", "লাইন": joined_text[:70]})
-            continue
-
-        has_sol, sol_y = line_has_solution_marker(line, joined_text, max_sol_x)
-        if has_sol:
-            stops.append((sol_y if sol_y is not None else wy0) - 1.2)
-            if xray_log is not None:
-                xray_log.append({"পৃষ্ঠা": page_no, "কলাম": col_no, "Y": round(wy0, 1), "সিদ্ধান্ত": "থামো (সমাধান ট্যাগ)", "লাইন": joined_text[:70]})
-            continue
-
-        if ("=" in joined_text or "⇒" in joined_text or "∴" in joined_text) and "?" not in joined_text:
-            if not EQ_GUARD_KW_RE.search(joined_text):
-                stops.append(wy0 - 1.0)
-                if xray_log is not None:
-                    xray_log.append({"পৃষ্ঠা": page_no, "কলাম": col_no, "Y": round(wy0, 1), "সিদ্ধান্ত": "থামো (সমীকরণ লাইন)", "লাইন": joined_text[:70]})
+            top_px = max(0, qm["y0"] - int(3.0 * SC))
+            bot_px = min(Hc - 1, stop_y_px)
+            if bot_px - top_px < int(MIN_Q_HEIGHT_PT * SC):
                 continue
 
-        if OPT_TOKEN_RE.match(t0):
-            continue
-
-        cand_indices = [0]
-        if len(line) > 1 and len(t0) <= 2 and re.match(r"^[\|\!\.\,\;\:\'\"\`\-\—\_\/\\]+$", t0):
-            cand_indices.append(1)
-
-        for idx_c in cand_indices:
-            cw = line[idx_c]
-            c_wx0, c_wy0, c_wx1, c_wy1, c_t0 = cw
-            if c_wx0 > max_q_x:
+            # বক্সের ভেতরের প্রকৃত লেখার সীমা অনুযায়ী উপরের, নিচের ও পাশের সাদা অংশ ছাঁটাই
+            sub_ink = c_dew[top_px:bot_px, :]
+            ys_nz, xs_nz = np.where(sub_ink > 0)
+            if len(ys_nz) < 25:
                 continue
 
-            is_num_q = bool(NUM_RE.match(c_t0) or PURE_PREFIX_RE.match(c_t0))
-            is_dotless_q = False
-            if not is_num_q and re.match(r"^[0-9০-৯]{1,2}$", c_t0):
-                if "?" in joined_text or DOTLESS_KW_RE.search(joined_text):
-                    is_dotless_q = True
+            bx0_col = max(0, int(xs_nz.min()) - int(4.0 * SC))
+            bx1_col = min(Wc - 1, int(xs_nz.max()) + int(5.0 * SC))
+            top_col = max(0, top_px + int(ys_nz.min()) - int(3.0 * SC))
+            bot_col = min(Hc - 1, top_px + int(ys_nz.max()) + int(3.5 * SC))
 
-            if is_num_q or is_dotless_q:
-                if re.match(r"^[0-9০-৯]+\.[0-9০-৯]+", c_t0):
-                    continue
-                m_num = NUM_RE.match(c_t0)
-                qn = _b2e_int(m_num.group(1)) if (m_num and m_num.group(1)) else (_b2e_int(c_t0) if is_dotless_q else None)
-                if qn is not None and (qn == 0 or qn > MAX_Q_NUMBER):
-                    continue
+            # ডিওয়ার্প ও শিয়ার কোঅর্ডিনেট থেকে মূল পিডিএফ পয়েন্টে রূপান্তর
+            yc_mid = int(0.5 * (top_col + bot_col))
+            ang_mid = float(thy[min(Hc - 1, max(0, yc_mid))])
+            dy_pad = abs(ang_mid) * (Wc * 0.35)
 
-                rest_text = " ".join(w[4] for w in line[idx_c + 1:]).strip()
-                if not rest_text:
-                    continue
+            orig_y0_px = max(0.0, top_col - dy_pad)
+            orig_y1_px = min(float(h_px - 2), bot_col + dy_pad)
+            shear_shift_x = div_slope * yc_mid if is_two_col else 0.0
+            orig_x0_px = max(4.0, cx0_px + bx0_col + shear_shift_x)
+            orig_x1_px = min(float(w_px - 4), cx0_px + bx1_col + shear_shift_x)
 
-                if ("=" in rest_text or "⇒" in rest_text or "∴" in rest_text) and "?" not in rest_text:
-                    if not EQ_GUARD_KW_RE.search(rest_text):
-                        continue
+            q_x0_pt = orig_x0_px / SC
+            q_y0_pt = orig_y0_px / SC
+            q_x1_pt = orig_x1_px / SC - RIGHT_EDGE_TRIM_PT
+            q_y1_pt = orig_y1_px / SC
 
-                has_q_words = bool(re.search(r"[অ-ঔক-হ]{2,}|[a-zA-Z]{3,}|\?", rest_text))
-                if not has_q_words and len(line) > idx_c + 1:
-                    nxt_w = line[idx_c + 1]
-                    if OPT_UNIT_RE.match(nxt_w[4]) or (nxt_w[0] - c_wx1 < 3.5 and re.match(r"^[0-9০-৯]", nxt_w[4])):
-                        continue
-                starts.append(c_wy0 - 1.5)
-                if xray_log is not None:
-                    xray_log.append({"পৃষ্ঠা": page_no, "কলাম": col_no, "Y": round(c_wy0, 1), "সিদ্ধান্ত": "শুরু (প্রশ্ন শনাক্ত)", "লাইন": joined_text[:70]})
-                break
+            if (q_x1_pt - q_x0_pt) >= 65.0 and (q_y1_pt - q_y0_pt) >= float(MIN_Q_HEIGHT_PT):
+                q_y0_pt, q_y1_pt = trim_vertical_whitespace(ink_mask, (q_x0_pt, q_x1_pt), q_y0_pt, q_y1_pt, MAX_BLANK_GAP_PT)
+                rect = fitz.Rect(q_x0_pt, q_y0_pt, q_x1_pt, q_y1_pt)
+                if not rect.is_empty and not rect.is_infinite:
+                    page_rects.append(rect)
+                    if xray_logs is not None:
+                        xray_logs.append({
+                            "পৃষ্ঠা": pno + 1, "কলাম": ci + 1,
+                            "Y": round(q_y0_pt, 1),
+                            "সিদ্ধান্ত": f"শনাক্ত (প্রশ্ন #{qm['num'] if qm['num'] else '?'})",
+                            "লাইন": f"Box: ({round(q_x0_pt,1)}, {round(q_y0_pt,1)}) -> ({round(q_x1_pt,1)}, {round(q_y1_pt,1)})"
+                        })
 
-    return starts, stops
-
-def is_valid_question_crop(lines_in_crop):
-    if not lines_in_crop:
-        return True
-    full_txt = " ".join(" ".join(w[4] for w in l) for l in lines_in_crop).strip()
-    if not full_txt:
-        return False
-
-    first_line = " ".join(w[4] for w in lines_in_crop[0]).strip()
-    if re.match(r"^(?:[\=\⇒\∴\∵]|\.\.\s*[0-9০-৯]|V_)", first_line) or is_solution_text(first_line):
-        return False
-
-    has_q_mark = "?" in full_txt
-    has_options = bool(re.search(r"(?:[\(\[]?[ক-ঘa-dA-D][\)\]\.]|[ⓐⓑⓒⓓ])", full_txt))
-    has_q_words = bool(VALID_CROP_KW_RE.search(full_txt))
-    eq_count = full_txt.count("=") + full_txt.count("⇒")
-
-    if eq_count >= 1 and not has_q_mark and not has_options and not has_q_words:
-        return False
-    if eq_count >= 2 and not has_q_mark and not has_options:
-        return False
-    return True
+    return page_rects
 
 # ==============================================================================
 # ৮. স্লাইড মোড: বক্সে ঘেরা প্রশ্ন শনাক্ত, Sol^n ও ফাঁকা জায়গা ছাঁটাই
@@ -953,14 +1187,11 @@ def box_has_question_number(page, gray, rect):
             top_y = min(w[1] for w in words)
             first_line = sorted([w for w in words if w[1] <= top_y + 12], key=lambda w: w[0])
             return any(NUM_RE.match(w[4].strip()) or PURE_PREFIX_RE.match(w[4].strip()) for w in first_line[:2])
-        x0, y0 = max(0, int(rect.x0 * SC)), max(0, int(rect.y0 * SC))
-        x1, y1 = int(rect.x1 * SC), int(min(rect.y1, rect.y0 + 45) * SC)
-        p_words = run_paddle_ocr_words(gray[y0:y1, x0:x1], base_x=rect.x0, base_y=rect.y0, scale=SC, min_y=0.0, max_y=9999.0)
-        if p_words:
-            txt = " ".join(w[4] for w in p_words).strip()
-            return bool(re.match(r"^\W{0,3}[\(\[]?\s*[0-9]{1,3}\s*[\)\]\.]", txt)) or any(
-                NUM_RE.match(w[4].strip()) or PURE_PREFIX_RE.match(w[4].strip()) for w in p_words[:2]
-            )
+        if pytesseract is not None:
+            x0, y0 = max(0, int(rect.x0 * SC)), max(0, int(rect.y0 * SC))
+            x1, y1 = int(rect.x1 * SC), int(min(rect.y1, rect.y0 + 45) * SC)
+            txt = pytesseract.image_to_string(gray[y0:y1, x0:x1], lang="eng", config="--psm 7").strip()
+            return bool(re.match(r"^\W{0,3}[\(\[]?\s*[0-9]{1,3}\s*[\)\]\.]", txt))
     except Exception:
         pass
     return False
@@ -968,20 +1199,31 @@ def box_has_question_number(page, gray, rect):
 def trim_solution_inside_slide_box(page, gray, ink, rect):
     cur_rect = rect
     try:
-        x0_px, y0_px = max(0, int(rect.x0 * SC)), max(0, int(rect.y0 * SC))
-        x1_px, y1_px = min(gray.shape[1], int(rect.x1 * SC)), min(gray.shape[0], int(rect.y1 * SC))
-        if y1_px - y0_px < 40 or x1_px - x0_px < 60:
-            return rect
-        roi = gray[y0_px:y1_px, x0_px:x1_px]
-        words = run_paddle_ocr_words(roi, base_x=rect.x0, base_y=rect.y0, scale=SC, min_y=0.0, max_y=9999.0)
-        lines = group_words_into_lines(words)
-        for ln in lines:
-            joined = " ".join(w[4] for w in ln)
-            has_s, sy = line_has_solution_marker(ln, joined, rect.x0 + (rect.width * 0.55))
-            if has_s and sy is not None and (sy - rect.y0) >= 18.0:
-                new_bot = snap_cut_line(ink, (rect.x0 + 4, rect.x1 - 4), sy - 1.5, up_win=2.5, down_win=0.5)
-                cur_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, max(rect.y0 + 18.0, new_bot))
-                break
+        if pytesseract is not None:
+            x0_px, y0_px = max(0, int(rect.x0 * SC)), max(0, int(rect.y0 * SC))
+            x1_px, y1_px = min(gray.shape[1], int(rect.x1 * SC)), min(gray.shape[0], int(rect.y1 * SC))
+            if y1_px - y0_px >= 40 and x1_px - x0_px >= 60:
+                roi = gray[y0_px:y1_px, x0_px:x1_px]
+                bw = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 13)
+                data = pytesseract.image_to_data(bw, lang="eng+ben", config="--psm 6", output_type=pytesseract.Output.DICT)
+                words = []
+                for i in range(len(data["text"])):
+                    t = data["text"][i].strip()
+                    if not t:
+                        continue
+                    wx0 = rect.x0 + data["left"][i] / SC
+                    wy0 = rect.y0 + data["top"][i] / SC
+                    wx1 = wx0 + data["width"][i] / SC
+                    wy1 = wy0 + data["height"][i] / SC
+                    words.append((wx0, wy0, wx1, wy1, t))
+                lines = group_words_into_lines(words)
+                for ln in lines:
+                    joined = " ".join(w[4] for w in ln)
+                    has_s, sy = line_has_solution_marker(ln, joined, rect.x0 + (rect.width * 0.55))
+                    if has_s and sy is not None and (sy - rect.y0) >= 18.0:
+                        new_bot = snap_cut_line(ink, (rect.x0 + 4, rect.x1 - 4), sy - 1.5, up_win=2.5, down_win=0.5)
+                        cur_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, max(rect.y0 + 18.0, new_bot))
+                        break
     except Exception:
         pass
 
@@ -1069,10 +1311,97 @@ def render_progress_card(placeholder, current_idx, total_pages, page_no, found_c
     </div>
     """, unsafe_allow_html=True)
 
+@st.cache_resource
+def load_trained_yolo_model():
+    """ফোল্ডারে থাকা ট্রেইনড question_detector.pt মডেলটি লোড করে।"""
+    model_path = "question_detector.pt"
+    if not os.path.exists(model_path):
+        return None, "ফোল্ডারে question_detector.pt ফাইলটি পাওয়া যায়নি!"
+    try:
+        from ultralytics import YOLO
+        return YOLO(model_path), None
+    except Exception as e:
+        return None, f"ultralytics লাইব্রেরি লোড হয়নি ({e})। টার্মিনালে pip install ultralytics রান করুন।"
+
+def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray_logs=None):
+    """ট্রেইন করা YOLOv8 মডেল দিয়ে পাতার প্রশ্নগুলো শনাক্ত করে।"""
+    yolo_sc = 2.0  # ডেটাসেট তৈরির সময় ব্যবহৃত স্কেলের সাথে শতভাগ মিল রাখা হয়েছে
+    pix = page.get_pixmap(matrix=fitz.Matrix(yolo_sc, yolo_sc), alpha=False)
+    img_rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+    preds = yolo_model.predict(source=img_bgr, conf=0.22, iou=0.45, imgsz=1024, verbose=False)
+
+    raw_boxes = []
+    for r in preds:
+        for box in r.boxes:
+            x0, y0, x1, y1 = [float(v) / yolo_sc for v in box.xyxy[0].tolist()]
+            conf = float(box.conf[0])
+            bw, bh = x1 - x0, y1 - y0
+
+            # অস্বাভাবিক ছোট বা পুরো পাতা জুড়ে থাকা ভুয়া বক্স বাদ দেওয়া
+            if bw < 48.0 or bh < float(MIN_Q_HEIGHT_PT):
+                continue
+            if bw > W * 0.88 and bh > H * 0.72:
+                continue
+
+            x0 = max(2.0, x0)
+            y0 = max(2.0, y0)
+            x1 = min(W - 2.0, x1 - RIGHT_EDGE_TRIM_PT)
+            y1 = min(H - 2.0, y1)
+            if x1 - x0 >= 48.0 and y1 - y0 >= float(MIN_Q_HEIGHT_PT):
+                raw_boxes.append((x0, y0, x1, y1, conf))
+
+    if not raw_boxes:
+        return []
+
+    # একই প্রশ্নের ওপর একাধিক ডুপ্লিকেট বক্স থাকলে সেরা কনফিডেন্সের বক্সটি রাখা
+    raw_boxes.sort(key=lambda b: b[4], reverse=True)
+    kept = []
+    for b in raw_boxes:
+        x0, y0, x1, y1, conf = b
+        bh = y1 - y0
+        bw = x1 - x0
+        is_dup = False
+        for kb in kept:
+            kx0, ky0, kx1, ky1, _ = kb
+            inter_x = max(0.0, min(x1, kx1) - max(x0, kx0))
+            inter_y = max(0.0, min(y1, ky1) - max(y0, ky0))
+            if inter_x / max(1.0, min(bw, kx1 - kx0)) > 0.45 and inter_y / max(1.0, min(bh, ky1 - ky0)) > 0.35:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(b)
+
+    # বাম কলাম ও ডান কলাম অনুযায়ী উপর থেকে নিচে সাজানো
+    kept.sort(key=lambda b: (0 if ((b[0] + b[2]) * 0.5 < W * 0.5) else 1, b[1]))
+
+    page_rects = []
+    for idx_b, (x0, y0, x1, y1, conf) in enumerate(kept, 1):
+        rect = fitz.Rect(x0, y0, x1, y1)
+        if not rect.is_empty and not rect.is_infinite:
+            page_rects.append(rect)
+            if xray_logs is not None:
+                xray_logs.append({
+                    "পৃষ্ঠা": pno + 1,
+                    "কলাম": 1 if (x0 + x1) * 0.5 < W * 0.5 else 2,
+                    "Y": round(y0, 1),
+                    "সিদ্ধান্ত": f"YOLO AI (#{idx_b} • {conf:.2f})",
+                    "লাইন": f"Box: ({round(x0,1)}, {round(y0,1)}) -> ({round(x1,1)}, {round(y1,1)})"
+                })
+
+    return page_rects
+
 def extract_questions_from_pdf(src_doc, page_indices, progress_slot, collect_xray=False):
     questions = []
     xray_logs = []
     total_to_scan = len(page_indices)
+
+    yolo_model, yolo_err = load_trained_yolo_model()
+    if yolo_err:
+        st.warning(f"⚠️ এআই মডেল বার্তা: {yolo_err}")
+    else:
+        st.toast("🧠 আপনার ট্রেইনড YOLO AI মডেল সক্রিয় আছে!")
 
     for idx, pno in enumerate(page_indices):
         render_progress_card(
@@ -1096,85 +1425,23 @@ def extract_questions_from_pdf(src_doc, page_indices, progress_slot, collect_xra
                 )
                 continue
 
-        div_x, is_two_col, div_slope, div_fn = trace_slanted_divider(gray, W, H)
+        log_target = xray_logs if collect_xray else None
+        page_rects = []
 
-        if is_two_col:
-            for r_px in range(ink.shape[0]):
-                xd_px = int(div_fn(r_px / SC) * SC)
-                ink[r_px, max(0, xd_px - int(3.5 * SC)):min(ink.shape[1], xd_px + int(3.5 * SC))] = False
-
-        col_ranges = [(12.0, div_x - 2.0), (div_x + 2.0, W - 12.0)] if is_two_col else [(12.0, W - 12.0)]
-
-        for col_i, (cx0, cx1) in enumerate(col_ranges):
-            inner_x0 = cx0 + (6.0 if col_i == 0 else 4.0)
-            inner_x1 = cx1 - (4.0 if (is_two_col and col_i == 0) else 10.0)
-            ink_band = ink[int(38 * SC):int((H - 30) * SC), int(inner_x0 * SC):int(inner_x1 * SC)].copy()
-            v_bar = cv2.morphologyEx(ink_band.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(25 * SC))))
-            ink_band_clean = ink_band & (~(v_bar > 0))
-            col_x_profile = np.where(ink_band_clean.mean(axis=0) > 0.003)[0]
-            actual_left_x = inner_x0 + (col_x_profile[0] / SC if len(col_x_profile) > 0 else 0)
-            actual_right_x = inner_x0 + (col_x_profile[-1] / SC if len(col_x_profile) > 0 else (inner_x1 - inner_x0))
-
-            scan_x0 = min(cx0, div_fn(20.0) + 1.5, div_fn(H - 20.0) + 1.5) if (is_two_col and col_i == 1) else cx0
-            scan_x1 = max(cx1, div_fn(20.0) - 1.5, div_fn(H - 20.0) - 1.5) if (is_two_col and col_i == 0) else cx1
-
-            pdf_lines, ocr_lines, ocr_thin_lines, ocr_eng_lines = get_column_lines(
-                page, gray, scan_x0, scan_x1, H, col_i=col_i, is_two_col=is_two_col, div_fn=div_fn
+        # ১. প্রথমে আপনার ট্রেইনড YOLO AI মডেল দিয়ে প্রশ্ন খোঁজা হবে
+        if yolo_model is not None:
+            page_rects = extract_page_questions_with_yolo(
+                yolo_model, page, ink, W, H, pno, xray_logs=log_target
             )
-            h_barriers = detect_horizontal_barriers(gray, cx0, cx1)
 
-            log_target = xray_logs if collect_xray else None
-            p_starts, p_stops = analyze_lines_for_markers(pdf_lines, actual_left_x, div_slope, H, log_target, pno + 1, col_i + 1)
-            o_starts, o_stops = analyze_lines_for_markers(ocr_lines, actual_left_x, div_slope, H, log_target, pno + 1, col_i + 1)
-            t_starts, t_stops = analyze_lines_for_markers(ocr_thin_lines, actual_left_x, div_slope, H, None, pno + 1, col_i + 1)
-            e_starts, e_stops = analyze_lines_for_markers(ocr_eng_lines, actual_left_x, div_slope, H, None, pno + 1, col_i + 1)
+        # ২. যদি কোনো পাতায় YOLO বক্স না পায়, তবে ফলব্যাক হিসেবে ভিশন ইঞ্জিন কাজ করবে
+        if not page_rects:
+            page_rects = extract_page_questions_vision_hybrid(
+                page, gray, ink, W, H, pno, xray_logs=log_target
+            )
 
-            all_starts = sorted(p_starts + o_starts + t_starts + e_starts)
-            all_stops = sorted(p_stops + o_stops + t_stops + e_stops + list(h_barriers))
-
-            clean_starts = []
-            for st_y in all_starts:
-                if not clean_starts or st_y - clean_starts[-1] > MIN_START_GAP_PT:
-                    clean_starts.append(st_y)
-
-            ref_lines = ocr_lines if len(ocr_lines) >= len(pdf_lines) else pdf_lines
-
-            for qi, st_y in enumerate(clean_starts):
-                nxt_q = clean_starts[qi + 1] if qi + 1 < len(clean_starts) else (H - 16.0)
-                cand_stops = [y for y in all_stops if st_y + 11.0 < y < nxt_q]
-                end_y = min(cand_stops) if cand_stops else nxt_q
-
-                crop_lines = [l for l in ref_lines if l and (st_y - 2.0 <= l[0][1] <= end_y + 2.0)]
-                if not is_valid_question_crop(crop_lines):
-                    if collect_xray:
-                        xray_logs.append({"পৃষ্ঠা": pno + 1, "কলাম": col_i + 1, "Y": round(st_y, 1), "সিদ্ধান্ত": "বাতিল (বৈধ প্রশ্ন নয়)", "লাইন": " ".join(w[4] for l in crop_lines[:1] for w in l)[:70]})
-                    continue
-
-                div_at_top = div_fn(st_y)
-                div_at_bot = div_fn(end_y)
-                if is_two_col and col_i == 0:
-                    q_x0 = max(8.0, cx0 - 2.0, min(actual_left_x - 6.0, 22.0))
-                    q_x1 = min(div_at_top, div_at_bot) - 2.0 - RIGHT_EDGE_TRIM_PT
-                elif is_two_col and col_i == 1:
-                    q_x0 = max(div_at_top, div_at_bot) + 1.5
-                    q_x1 = min(W - 8.0, actual_right_x + 6.0) - RIGHT_EDGE_TRIM_PT
-                else:
-                    q_x0 = max(8.0, cx0 - 2.0, actual_left_x - 6.0)
-                    q_x1 = min(cx1, actual_right_x + 6.0) - RIGHT_EDGE_TRIM_PT
-
-                if q_x1 - q_x0 < 75:
-                    continue
-
-                top = snap_cut_line(ink, (q_x0, q_x1), st_y, up_win=3.0, down_win=1.0)
-                bot = snap_cut_line(ink, (q_x0, q_x1), end_y, up_win=1.8, down_win=0.8)
-                top, bot = trim_vertical_whitespace(ink, (q_x0, q_x1), top, bot, MAX_BLANK_GAP_PT)
-
-                if bot - top >= float(MIN_Q_HEIGHT_PT) and q_x1 - q_x0 >= 75.0:
-                    box_ink = ink[int(top * SC):int(bot * SC), int(q_x0 * SC):int(q_x1 * SC)]
-                    if box_ink.size > 0 and box_ink.mean() > 0.004:
-                        rect = fitz.Rect(q_x0, top, q_x1, bot)
-                        if not rect.is_empty and not rect.is_infinite:
-                            questions.append((pno, rect))
+        for r in page_rects:
+            questions.append((pno, r))
 
         render_progress_card(
             progress_slot, idx + 1, total_to_scan, pno + 1, len(questions),
@@ -1248,8 +1515,44 @@ def build_practice_pdf(src_doc, questions, custom_gaps=None):
     return pdf_bytes
 
 # ==============================================================================
-# ৯.৯ বাহ্যিক canvas_editor.html লোডার, বক্স সিঙ্ক ও পিন-সুরক্ষিত লার্নিং কার্ড
+# ৯.৯ বাহ্যিক canvas_editor.html লোডার ও বক্স এডিটর থেকে YOLO ডেটাসেট অটো-সেভার
 # ==============================================================================
+def save_corrected_boxes_to_yolo_dataset(raw_pdf, new_df):
+    try:
+        img_dir = os.path.join("yolo_dataset", "images")
+        lbl_dir = os.path.join("yolo_dataset", "labels")
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(lbl_dir, exist_ok=True)
+
+        doc = fitz.open(stream=raw_pdf, filetype="pdf")
+        active_df = new_df[new_df["keep"] == True]
+        for p_num, grp in active_df.groupby("page"):
+            pno = int(p_num) - 1
+            if not (0 <= pno < len(doc)) or len(grp) < 2:
+                continue
+            page = doc[pno]
+            W, H = float(page.rect.width), float(page.rect.height)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+            img_rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+            yolo_lines = []
+            for _, r in grp.iterrows():
+                x0, y0, x1, y1 = float(r["x0"]), float(r["y0"]), float(r["x1"]), float(r["y1"])
+                xc = max(0.0, min(1.0, ((x0 + x1) * 0.5) / W))
+                yc = max(0.0, min(1.0, ((y0 + y1) * 0.5) / H))
+                bw = max(0.01, min(1.0, abs(x1 - x0) / W))
+                bh = max(0.01, min(1.0, abs(y1 - y0) / H))
+                yolo_lines.append(f"0 {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
+
+            stamp = f"edited_p{p_num}_{len(raw_pdf)}"
+            cv2.imwrite(os.path.join(img_dir, f"{stamp}.jpg"), img_bgr)
+            with open(os.path.join(lbl_dir, f"{stamp}.txt"), "w", encoding="utf-8") as f:
+                f.write("\n".join(yolo_lines))
+        doc.close()
+    except Exception:
+        pass
+
 def _order_items_reading(items):
     items = sorted(items, key=lambda it: (it[0].y0, it[0].x0))
     rows, out = [], []
@@ -1408,7 +1711,8 @@ def prepare_pages_payload_for_canvas(raw_pdf, page_indices):
 def build_interactive_canvas_html(pages_data, initial_boxes, file_key, template_file="canvas_editor.html"):
     pages_json = json.dumps(pages_data)
     boxes_json = json.dumps(initial_boxes)
-    safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", file_key)
+    scan_ts = st.session_state.get("rv_scan_ts", "v5")
+    safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", f"{file_key}_{scan_ts}")
     w_gap_pt = int(float(st.session_state.get("rv_w_gap_pt", 90)))
 
     if os.path.exists(template_file):
@@ -1423,7 +1727,6 @@ def build_interactive_canvas_html(pages_data, initial_boxes, file_key, template_
     return "<div style='color:#fff;padding:12px;'>canvas_editor.html ফাইলটি পাওয়া যায়নি।</div>"
 
 def render_learning_suggestions():
-    """একটি স্থির ও মিনিমাল বক্সে একটার পর একটা প্যাটার্ন দেখানোর ক্যারোসেল কার্ড (কনফ্লিক্ট চেকারসহ)।"""
     suggestions = st.session_state.get("rv_suggestions", [])
     if not suggestions:
         return
@@ -1475,7 +1778,6 @@ def render_learning_suggestions():
                 label_visibility="collapsed"
             )
 
-        # যদি এই প্যাটার্নটি অন্য কোনো ক্যাটাগরিতে আগে থেকেই থেকে থাকে তবে সতর্কবার্তা ও ক্যাটাগরি নির্বাচন দেখানো
         sug_conflict = st.session_state.get("rv_sug_conflict")
         if sug_conflict and sug_conflict.get("pattern") == disp_pat:
             st.error(sug_conflict["err_text"])
@@ -1587,6 +1889,7 @@ def render_results_and_review(raw_pdf, file_key):
                 b["w_gap"] = bool(b.get("w_gap", False))
             new_df = pd.DataFrame(new_boxes, columns=["keep", "page", "x0", "y0", "x1", "y1", "w_gap"])
 
+            save_corrected_boxes_to_yolo_dataset(raw_pdf, new_df)
             learned = analyze_user_corrections(raw_pdf, old_df, new_df)
             if learned:
                 cur_sugs = st.session_state.get("rv_suggestions", [])
@@ -1658,7 +1961,7 @@ st.markdown("""
         <h1 class="studio-title">SMART SCANNER</h1>
         <p class="studio-sub">Cut Out Only Questions From PDF</p>
     </div>
-    <span class="studio-badge">VISION ENGINE</span>
+    <span class="studio-badge">VISION v5.0</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1710,6 +2013,7 @@ if uploaded_file is not None:
             st.session_state["rv_pages"] = len(selected_pages)
             st.session_state["rv_page_indices"] = selected_pages
             st.session_state["rv_file_key"] = file_key
+            st.session_state["rv_scan_ts"] = str(int(time.time() * 1000))
             st.session_state["rv_suggestions"] = []
             st.session_state["rv_custom_gaps"] = {}
             st.session_state["rv_ver"] = st.session_state.get("rv_ver", 0) + 1
@@ -1739,6 +2043,7 @@ if uploaded_file is not None:
             qs = rows_to_questions(updated_df, src_doc)
             st.session_state["rv_auto_pdf"] = build_practice_pdf(src_doc, qs) if qs else None
             src_doc.close()
+            st.session_state["rv_scan_ts"] = str(int(time.time() * 1000))
             st.session_state["rv_ver"] = st.session_state.get("rv_ver", 0) + 1
         except Exception as e:
             st.error(f"ত্রুটি: {e}")
@@ -1753,7 +2058,6 @@ if components is not None:
         components.html(global_ui_html, height=0, scrolling=False)
     except Exception:
         pass
-
 
 # ১২. নরম ঝাপসা ব্যাকগ্রাউন্ড ও সিন্থেসাইজ সাউন্ড এফেক্ট
 def load_ambient_and_sfx(css_file="ambient.css", js_file="sfx.js"):
