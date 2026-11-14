@@ -19,8 +19,21 @@ import cv2
 import fitz
 import numpy as np
 import pandas as pd
-import pytesseract
 import streamlit as st
+
+# উইন্ডোজ পিসিতে প্যাডেল ইঞ্জিন যেন ক্র্যাশ না করে তার নিরাপত্তা সেটিংস
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    from paddleocr import PaddleOCR
+except Exception:
+    PaddleOCR = None
 
 try:
     import streamlit.components.v1 as components
@@ -38,6 +51,23 @@ from learning_engine import (
     CATEGORY_LABELS_BN,
     KB_FILENAME
 )
+
+@st.cache_resource(show_spinner=False)
+def get_paddle_ocr_engine():
+    """প্যাডেল-ওসিআর মডেল মেমোরিতে একবারই লোড করে রাখে।"""
+    if PaddleOCR is None:
+        return None
+    for kwargs in (
+        {"use_angle_cls": True, "lang": "en", "show_log": False},
+        {"use_angle_cls": True, "lang": "en"},
+        {"lang": "en"},
+        {},
+    ):
+        try:
+            return PaddleOCR(**kwargs)
+        except Exception:
+            continue
+    return None
 
 # ১. পেজ কনফিগারেশন
 st.set_page_config(
@@ -608,6 +638,111 @@ def group_words_into_lines(words):
     lines.append(cur_line)
     return lines
 
+def _parse_paddle_raw_result(raw_res):
+    """PaddleOCR v2 এবং v3 উভয় সংস্করণের আউটপুট থেকে (poly, text, score) আলাদা করে।"""
+    parsed = []
+    if not raw_res:
+        return parsed
+
+    for page_item in raw_res:
+        if page_item is None:
+            continue
+        if isinstance(page_item, dict) or hasattr(page_item, "keys"):
+            d = page_item if isinstance(page_item, dict) else dict(page_item)
+            texts = d.get("rec_texts", [])
+            scores = d.get("rec_scores", [])
+            polys = d.get("dt_polys", d.get("rec_polys", d.get("rec_boxes", [])))
+            for idx, txt in enumerate(texts):
+                sc_val = float(scores[idx]) if idx < len(scores) else 0.9
+                poly = polys[idx] if idx < len(polys) else None
+                if poly is not None and str(txt).strip():
+                    parsed.append((poly, str(txt).strip(), sc_val))
+            continue
+
+        if isinstance(page_item, (list, tuple)):
+            if (
+                len(page_item) == 2
+                and isinstance(page_item[1], (list, tuple))
+                and len(page_item[1]) >= 2
+                and isinstance(page_item[1][0], str)
+            ):
+                parsed.append((page_item[0], page_item[1][0].strip(), float(page_item[1][1])))
+            else:
+                for line_item in page_item:
+                    if (
+                        isinstance(line_item, (list, tuple))
+                        and len(line_item) == 2
+                        and isinstance(line_item[1], (list, tuple))
+                        and len(line_item[1]) >= 2
+                    ):
+                        parsed.append((line_item[0], str(line_item[1][0]).strip(), float(line_item[1][1])))
+    return parsed
+
+
+def run_paddle_ocr_words(gray_roi, base_x, base_y, scale, min_y=12.0, max_y=9999.0):
+    """প্যাডেল-ওসিআর চালিয়ে প্রতিটি শব্দকে (wx0, wy0, wx1, wy1, text) ফরম্যাটে রূপান্তর করে।"""
+    engine = get_paddle_ocr_engine()
+    if engine is None or gray_roi is None or gray_roi.size == 0:
+        return []
+
+    if len(gray_roi.shape) == 2:
+        img_bgr = cv2.cvtColor(gray_roi, cv2.COLOR_GRAY2BGR)
+    else:
+        img_bgr = gray_roi
+
+    raw_res = None
+    for call_fn in (
+        lambda: engine.ocr(img_bgr, cls=True),
+        lambda: engine.ocr(img_bgr),
+        lambda: list(engine.predict(img_bgr)),
+    ):
+        try:
+            raw_res = call_fn()
+            break
+        except Exception:
+            continue
+
+    items = _parse_paddle_raw_result(raw_res)
+    words_out = []
+
+    for poly, txt, conf in items:
+        if not txt or conf < 0.18:
+            continue
+        try:
+            arr = np.array(poly, dtype=float)
+            if arr.ndim == 1 and arr.size == 4:
+                px0, py0, px1, py1 = float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+            else:
+                pts = arr.reshape(-1, 2)
+                px0, py0 = float(pts[:, 0].min()), float(pts[:, 1].min())
+                px1, py1 = float(pts[:, 0].max()), float(pts[:, 1].max())
+        except Exception:
+            continue
+
+        line_x0 = base_x + (px0 / scale)
+        line_y0 = base_y + (py0 / scale)
+        line_x1 = base_x + (px1 / scale)
+        line_y1 = base_y + (py1 / scale)
+
+        if not (min_y < line_y0 < max_y):
+            continue
+
+        tokens = [t for t in txt.split() if t]
+        if not tokens:
+            continue
+
+        total_w = max(4.0, line_x1 - line_x0)
+        char_lens = [max(1, len(t)) for t in tokens]
+        total_chars = sum(char_lens)
+        cur_x = line_x0
+        for tok, c_len in zip(tokens, char_lens):
+            w_span = total_w * (c_len / total_chars)
+            words_out.append((cur_x, line_y0, cur_x + w_span, line_y1, tok))
+            cur_x += w_span
+
+    return words_out
+
+
 def get_column_lines(page, gray_img, x0, x1, H, col_i=0, is_two_col=True, div_fn=None):
     pdf_words = []
     for wx0, wy0, wx1, wy1, text, *_ in page.get_text("words"):
@@ -638,55 +773,35 @@ def get_column_lines(page, gray_img, x0, x1, H, col_i=0, is_two_col=True, div_fn
             roi_gray[:, -int(12 * SC):] = 255
 
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(roi_gray)
-        clean_bw = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 14)
         base_x = x0_px / SC
 
-        ocr_data = pytesseract.image_to_data(
-            clean_bw, lang="eng+ben", config="--psm 6", output_type=pytesseract.Output.DICT
-        )
-        for i in range(len(ocr_data["text"])):
-            txt = ocr_data["text"][i].strip()
-            conf = int(ocr_data["conf"][i]) if str(ocr_data["conf"][i]).lstrip("-").isdigit() else -1
-            if not txt or conf < 16:
-                continue
-            wx0 = base_x + ocr_data["left"][i] / SC
-            wy0 = ocr_data["top"][i] / SC
-            wx1 = wx0 + ocr_data["width"][i] / SC
-            wy1 = wy0 + ocr_data["height"][i] / SC
-            if 12 < wy0 < H - 18:
-                ocr_words.append((wx0, wy0, wx1, wy1, txt))
+        # পাস ১: প্রধান PaddleOCR ডিপ লার্নিং স্ক্যান
+        ocr_words = run_paddle_ocr_words(clahe, base_x=base_x, base_y=0.0, scale=SC, min_y=12.0, max_y=H - 18.0)
 
-        thin_bw = cv2.dilate(clean_bw, np.ones((2, 2), np.uint8), iterations=1)
-        ocr_data2 = pytesseract.image_to_data(
-            thin_bw, lang="ben+eng", config="--psm 6", output_type=pytesseract.Output.DICT
-        )
-        for i in range(len(ocr_data2["text"])):
-            txt = ocr_data2["text"][i].strip()
-            conf = int(ocr_data2["conf"][i]) if str(ocr_data2["conf"][i]).lstrip("-").isdigit() else -1
-            if not txt or conf < 16:
-                continue
-            wx0 = base_x + ocr_data2["left"][i] / SC
-            wy0 = ocr_data2["top"][i] / SC
-            wx1 = wx0 + ocr_data2["width"][i] / SC
-            wy1 = wy0 + ocr_data2["height"][i] / SC
-            if 12 < wy0 < H - 18:
-                ocr_thin_words.append((wx0, wy0, wx1, wy1, txt))
+        # পাস ২: বাম পাশের মার্জিন স্ট্রিপে PaddleOCR স্ক্যান (প্রশ্ন নম্বর ও Soln ট্যাগ আরও নিখুঁতভাবে ধরতে)
+        left_strip_w = min(clahe.shape[1], int(115 * SC))
+        ocr_eng_words = run_paddle_ocr_words(clahe[:, :left_strip_w], base_x=base_x, base_y=0.0, scale=SC, min_y=12.0, max_y=H - 18.0)
 
-        left_strip_w = min(clean_bw.shape[1], int(105 * SC))
-        eng_data = pytesseract.image_to_data(
-            clean_bw[:, :left_strip_w], lang="eng", config="--psm 6", output_type=pytesseract.Output.DICT
-        )
-        for i in range(len(eng_data["text"])):
-            txt = eng_data["text"][i].strip()
-            conf = int(eng_data["conf"][i]) if str(eng_data["conf"][i]).lstrip("-").isdigit() else -1
-            if not txt or conf < 15:
-                continue
-            wx0 = base_x + eng_data["left"][i] / SC
-            wy0 = eng_data["top"][i] / SC
-            wx1 = wx0 + eng_data["width"][i] / SC
-            wy1 = wy0 + eng_data["height"][i] / SC
-            if 12 < wy0 < H - 18:
-                ocr_eng_words.append((wx0, wy0, wx1, wy1, txt))
+        # পাস ৩ (ঐচ্ছিক ফলব্যাক): যদি পিসিতে বা ক্লাউডে Tesseract থাকে, তবে বাংলা শব্দের জন্য সহায়ক পাস
+        if pytesseract is not None:
+            try:
+                clean_bw = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 14)
+                ocr_data2 = pytesseract.image_to_data(
+                    clean_bw, lang="ben+eng", config="--psm 6", output_type=pytesseract.Output.DICT
+                )
+                for i in range(len(ocr_data2["text"])):
+                    txt = ocr_data2["text"][i].strip()
+                    conf = int(ocr_data2["conf"][i]) if str(ocr_data2["conf"][i]).lstrip("-").isdigit() else -1
+                    if not txt or conf < 18:
+                        continue
+                    wx0 = base_x + ocr_data2["left"][i] / SC
+                    wy0 = ocr_data2["top"][i] / SC
+                    wx1 = wx0 + ocr_data2["width"][i] / SC
+                    wy1 = wy0 + ocr_data2["height"][i] / SC
+                    if 12 < wy0 < H - 18:
+                        ocr_thin_words.append((wx0, wy0, wx1, wy1, txt))
+            except Exception:
+                pass
 
     return (
         pdf_lines,
@@ -840,10 +955,15 @@ def box_has_question_number(page, gray, rect):
             return any(NUM_RE.match(w[4].strip()) or PURE_PREFIX_RE.match(w[4].strip()) for w in first_line[:2])
         x0, y0 = max(0, int(rect.x0 * SC)), max(0, int(rect.y0 * SC))
         x1, y1 = int(rect.x1 * SC), int(min(rect.y1, rect.y0 + 45) * SC)
-        txt = pytesseract.image_to_string(gray[y0:y1, x0:x1], lang="eng", config="--psm 7").strip()
-        return bool(re.match(r"^\W{0,3}[\(\[]?\s*[0-9]{1,3}\s*[\)\]\.]", txt))
+        p_words = run_paddle_ocr_words(gray[y0:y1, x0:x1], base_x=rect.x0, base_y=rect.y0, scale=SC, min_y=0.0, max_y=9999.0)
+        if p_words:
+            txt = " ".join(w[4] for w in p_words).strip()
+            return bool(re.match(r"^\W{0,3}[\(\[]?\s*[0-9]{1,3}\s*[\)\]\.]", txt)) or any(
+                NUM_RE.match(w[4].strip()) or PURE_PREFIX_RE.match(w[4].strip()) for w in p_words[:2]
+            )
     except Exception:
-        return False
+        pass
+    return False
 
 def trim_solution_inside_slide_box(page, gray, ink, rect):
     cur_rect = rect
@@ -853,18 +973,7 @@ def trim_solution_inside_slide_box(page, gray, ink, rect):
         if y1_px - y0_px < 40 or x1_px - x0_px < 60:
             return rect
         roi = gray[y0_px:y1_px, x0_px:x1_px]
-        bw = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 13)
-        data = pytesseract.image_to_data(bw, lang="eng+ben", config="--psm 6", output_type=pytesseract.Output.DICT)
-        words = []
-        for i in range(len(data["text"])):
-            t = data["text"][i].strip()
-            if not t:
-                continue
-            wx0 = rect.x0 + data["left"][i] / SC
-            wy0 = rect.y0 + data["top"][i] / SC
-            wx1 = wx0 + data["width"][i] / SC
-            wy1 = wy0 + data["height"][i] / SC
-            words.append((wx0, wy0, wx1, wy1, t))
+        words = run_paddle_ocr_words(roi, base_x=rect.x0, base_y=rect.y0, scale=SC, min_y=0.0, max_y=9999.0)
         lines = group_words_into_lines(words)
         for ln in lines:
             joined = " ".join(w[4] for w in ln)
@@ -876,7 +985,6 @@ def trim_solution_inside_slide_box(page, gray, ink, rect):
     except Exception:
         pass
 
-    # বক্সের ভেতরে নিচে উত্তর লেখার ফাঁকা জায়গা থাকলে তা ছাঁটাই করা
     try:
         _, trimmed_bot = trim_vertical_whitespace(
             ink,
