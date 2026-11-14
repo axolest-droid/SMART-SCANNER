@@ -53,6 +53,10 @@ from learning_engine import (
     find_all_tag_conflicts,
     resolve_tag_conflicts,
     sync_all_kb_files,
+    push_file_to_github,
+    push_binary_file_to_github,
+    trigger_github_yolo_training,
+    get_github_training_status,
     CATEGORY_LABELS_BN,
     KB_FILENAME
 )
@@ -300,6 +304,17 @@ with st.sidebar:
                     st.session_state["is_admin_unlocked"] = False
                     st.rerun()
 
+        st.markdown("---")
+        st.caption("🤖 **১-ক্লিক ক্লাউড এআই মডেল ট্রেইনিং**")
+        if st.button("🚀 মডেল ট্রেইন ও আপডেট (.pt)", key="btn_cloud_yolo_train", use_container_width=True):
+            ok_tr, msg_tr = trigger_github_yolo_training()
+            if ok_tr:
+                st.success(msg_tr)
+            else:
+                st.error(msg_tr)
+
+        if st.button("📊 ট্রেইনিং স্ট্যাটাস দেখুন", key="btn_check_yolo_status", use_container_width=True):
+            st.info(get_github_training_status())
         st.download_button(
             label="⬇ ব্যাকআপ",
             data=json.dumps(KB, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -594,7 +609,7 @@ def trim_vertical_whitespace(ink, xr, top, bot, max_gap_pt=None):
     return max(top, (y0 + first_row) / SC - 3.5), min(bot, (y0 + last_row) / SC + 5.0)
 
 # ==============================================================================
-# ৭. ভিশন ও ডিওয়ার্পিং ইঞ্জিন (বাঁকা পাতা সোজা করা + র‍্যানস্যাক মার্জিন + সিকোয়েন্স রিকভারি)
+# ৭. ইউনিভার্সাল ভিশন + ট্রেইনড YOLO AI ফিউশন ইঞ্জিন (ACS + উদ্ভাস + যেকোনো পিডিএফ)
 # ==============================================================================
 def _best_local_tilt_angle(ink_seg, rng=5.5, step=0.25):
     if ink_seg.size == 0 or ink_seg.sum() < 150:
@@ -613,7 +628,6 @@ def _best_local_tilt_angle(ink_seg, rng=5.5, step=0.25):
     return best_ang
 
 def _dewarp_column_arrays(norm_col, clean_ink_col, raw_ink_col):
-    """কলামের বাঁকা বা ঢেউ খেলানো লাইনগুলোকে অনুভূমিকভাবে সোজা করে।"""
     H_c, W_c = clean_ink_col.shape[:2]
     win = max(120, int(150 * SC))
     step = max(60, int(75 * SC))
@@ -639,7 +653,6 @@ def _dewarp_column_arrays(norm_col, clean_ink_col, raw_ink_col):
     return n_dew, c_dew, r_dew, thy
 
 def _detect_header_bottom_px(raw_ink_col):
-    """কলামের উপরের হেডার লাইনের নিচের সীমানা বের করে।"""
     H_c, W_c = raw_ink_col.shape[:2]
     joined = cv2.dilate(raw_ink_col, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(3.5 * SC)), 1)))
     min_w = max(30, int(W_c * 0.42))
@@ -710,11 +723,33 @@ def _first_token_span(ink_col, y0, y1, gap_px):
         e = int(x)
     return s, e, int(xs[-1])
 
+def _line_tokens_info(ink_col, y0, y1, gap_px):
+    cols = ink_col[y0:y1, :].sum(axis=0) > 0
+    xs = np.where(cols)[0]
+    if len(xs) == 0:
+        return None
+    runs = []
+    s = int(xs[0])
+    e = s
+    for x in xs[1:]:
+        ix = int(x)
+        if ix - e > gap_px:
+            runs.append((s, e))
+            s = ix
+        e = ix
+    runs.append((s, e))
+    x0, ft_end = runs[0]
+    tw = ft_end - x0 + 1
+    sec_x0 = runs[1][0] if len(runs) >= 2 else None
+    x1 = runs[-1][1]
+    return {
+        "y0": y0, "y1": y1,
+        "x0": x0, "ft_end": ft_end, "tw": tw,
+        "sec_x0": sec_x0, "x1": x1, "span": x1 - x0,
+        "num_runs": len(runs)
+    }
+
 def _fit_slanted_margin_ransac(line_items):
-    """
-    র‍্যানস্যাক (RANSAC) পদ্ধতিতে কলামের প্রকৃত ঢালু বাম মার্জিন রেখা (x = a*y + b) বের করে।
-    বাম দিকের আউটলায়ারকে ৩ গুণ পেনাল্টি দেয় যাতে ইনডেন্টেড অপশন সারি মার্জিনকে ডানে টেনে না নেয়।
-    """
     if len(line_items) < 4:
         b_def = float(min((it["x0"] for it in line_items), default=0.0))
         return 0.0, b_def, lambda _y, b=b_def: b
@@ -753,7 +788,6 @@ def _fit_slanted_margin_ransac(line_items):
     return a, b, lambda y, a=a, b=b: float(a * float(y) + b)
 
 def _ocr_digits_voting(strip_gray, y0, y1, x_start):
-    """মার্জিনের ছোট নম্বর ক্রপে একাধিক প্রস্থ ও থ্রেশহোল্ড চালিয়ে ভোটিং ওসিআর করে।"""
     if pytesseract is None:
         return None
     votes = {}
@@ -817,21 +851,331 @@ def group_words_into_lines(words):
     lines.append(cur_line)
     return lines
 
-def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xray_logs=None):
-    """
-    বাঁকা বা সোজা যেকোনো পিডিএফ পাতার জন্য সম্পূর্ণ সমন্বিত পাইপলাইন:
-    ১. ঢালু কলাম ডিভাইডার ও কলাম ডিওয়ার্পিং।
-    ২. র‍্যানস্যাক ঢালু বাম মার্জিন ও মার্জিন স্ট্রিপ এক্সট্রাকশন।
-    ৩. প্রথম টোকেনের প্রস্থ (সংখ্যা বনাম 'উত্তর:'/'ব্যাখ্যা:'), অপশন বৃত্ত, সিকোয়েন্স রিকভারি
-       এবং নলেজ-বেস ট্যাগের সমন্বয়ে প্রতিটি প্রশ্নের নিখুঁত বক্স নির্ণয়।
-    """
+# ==============================================================================
+# ৭.১ উদ্ভাস ও ঝুলন্ত-মার্জিন ইঞ্জিন (টেবিল মাস্কিং + ঝুলন্ত প্রশ্ন নম্বর + ডান বৃত্ত)
+# ==============================================================================
+def _find_udvash_valid_zones(ink_s, div_px, h_px, w_px):
+    top_lim = int(36.0 * SC)
+    bot_lim = h_px - int(38.0 * SC)
+
+    v_open = cv2.morphologyEx(ink_s, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(20.0 * SC))))
+    center_strip = v_open[:, max(0, div_px - int(16.0 * SC)):min(w_px, div_px + int(16.0 * SC))]
+    has_div = (center_strip.sum(axis=1) > 0).astype(np.uint8)
+    bridged_div = cv2.dilate(has_div.reshape(-1, 1), np.ones((int(26.0 * SC), 1), np.uint8)).ravel() > 0
+
+    j_h = cv2.dilate(ink_s, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(3.5 * SC)), 1)))
+    wide_h = cv2.morphologyEx(j_h, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (int(w_px * 0.46), 1)))
+    wide_rows = np.where(wide_h.sum(axis=1) > int(w_px * 0.42))[0]
+
+    is_table_or_banner = np.zeros(h_px, dtype=bool)
+    if len(wide_rows) > 0:
+        distinct_y = []
+        for y in wide_rows:
+            if not distinct_y or (y - distinct_y[-1]) > int(4.0 * SC):
+                distinct_y.append(int(y))
+        for y in distinct_y:
+            is_table_or_banner[max(0, y - int(4 * SC)):min(h_px, y + int(5 * SC))] = True
+        for i in range(len(distinct_y) - 1):
+            if (distinct_y[i + 1] - distinct_y[i]) <= int(95.0 * SC):
+                is_table_or_banner[distinct_y[i]:distinct_y[i + 1] + 1] = True
+
+    if int(bridged_div.sum()) < int(h_px * 0.12):
+        active = ~is_table_or_banner
+    else:
+        active = bridged_div & (~is_table_or_banner)
+
+    active[:top_lim] = False
+    active[bot_lim:] = False
+
+    zones = []
+    s = None
+    min_zh = int(40.0 * SC)
+    for y_i, val in enumerate(active):
+        if val and s is None:
+            s = y_i
+        elif not val and s is not None:
+            if (y_i - s) >= min_zh:
+                zones.append((max(top_lim, s - int(4.0 * SC)), min(bot_lim, y_i + int(4.0 * SC))))
+            s = None
+    if s is not None and (bot_lim - s) >= min_zh:
+        zones.append((max(top_lim, s - int(4.0 * SC)), bot_lim))
+
+    return zones
+
+def _find_column_subbanners_y(r_dew, zy0, zy1):
+    Hc, Wc = r_dew.shape[:2]
+    joined = cv2.dilate(r_dew, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(3.0 * SC)), 1)))
+    min_bw = int(Wc * 0.42)
+    h_lines = cv2.morphologyEx(joined, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (min_bw, 1)))
+    ys = np.where(h_lines[zy0:zy1, :].sum(axis=1) > min_bw * 0.75)[0] + zy0
+    if len(ys) == 0:
+        return []
+    distinct_y = []
+    for y in ys:
+        if not distinct_y or (y - distinct_y[-1]) > int(4.0 * SC):
+            distinct_y.append(int(y))
+    banners = []
+    i = 0
+    while i < len(distinct_y):
+        paired = False
+        for j in range(i + 1, len(distinct_y)):
+            dy = distinct_y[j] - distinct_y[i]
+            if int(11.0 * SC) <= dy <= int(34.0 * SC):
+                banners.append((distinct_y[i], distinct_y[j]))
+                i = j + 1
+                paired = True
+                break
+        if not paired:
+            i += 1
+    return banners
+
+def _find_udvash_right_answer_circle(n_dew, c_dew, y_top, y_bot):
+    Hc, Wc = n_dew.shape[:2]
+    rx0 = int(Wc * 0.82)
+    ry0 = max(0, int(y_top))
+    ry1 = min(Hc, int(y_bot))
+    if Wc - rx0 < 12 or ry1 - ry0 < 10:
+        return None
+
+    roi = n_dew[ry0:ry1, rx0:Wc]
+    bw = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+    cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_d, max_d = int(5.2 * SC), int(15.2 * SC)
+    candidates = []
+    for c in cnts:
+        bx, by, bw_c, bh_c = cv2.boundingRect(c)
+        if min_d <= bw_c <= max_d and min_d <= bh_c <= max_d:
+            aspect = bw_c / float(max(1, bh_c))
+            if 0.68 <= aspect <= 1.42:
+                area = cv2.contourArea(c)
+                if area >= 0.28 * (bw_c * bh_c):
+                    abs_x0 = rx0 + bx
+                    abs_y0 = ry0 + by
+                    abs_y1 = abs_y0 + bh_c
+                    left_gap = c_dew[abs_y0:abs_y1, max(0, abs_x0 - int(3.5 * SC)):max(1, abs_x0 - 1)]
+                    if left_gap.size == 0 or float(left_gap.mean()) < 0.18:
+                        candidates.append((abs_y0, abs_y1, abs_x0))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0]
+
+def _try_extract_udvash_page(page, gray_img, ink_mask, W, H, pno, xray_logs=None):
+    norm_gray = normalize_shadow_gray(gray_img)
+    raw_ink = get_ink_mask(gray_img).astype(np.uint8)
+    h_px, w_px = gray_img.shape[:2]
+
+    div_x_pt, is_two_col, div_slope, div_fn = trace_slanted_divider(gray_img, W, H)
+    if not is_two_col:
+        div_x_pt = W * 0.5
+        div_slope = 0.0
+        div_fn = lambda _y: W * 0.5
+
+    if abs(div_slope) > 0.002:
+        M_shear = np.float32([[1.0, -div_slope, 0.0], [0.0, 1.0, 0.0]])
+        norm_s = cv2.warpAffine(norm_gray, M_shear, (w_px, h_px), borderValue=255)
+        ink_s = cv2.warpAffine(raw_ink, M_shear, (w_px, h_px), borderValue=0)
+        div_px = int(round(div_fn(0.0) * SC))
+    else:
+        norm_s = norm_gray.copy()
+        ink_s = raw_ink.copy()
+        div_px = int(round(div_x_pt * SC))
+
+    valid_zones = _find_udvash_valid_zones(ink_s, div_px, h_px, w_px)
+    if not valid_zones:
+        return None
+
+    v_div = cv2.morphologyEx(ink_s, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, int(h_px * 0.08)))))
+    clean_s = ink_s & (cv2.dilate(v_div, np.ones((1, 5), np.uint8)) == 0).astype(np.uint8)
+
+    left_edge_px = int(12.0 * SC)
+    right_edge_px = int(28.0 * SC)
+    col_px_ranges = [
+        (left_edge_px, max(left_edge_px + 50, div_px - 3)),
+        (min(w_px - 50, div_px + 3), w_px - right_edge_px)
+    ]
+
+    min_band_h = max(5, int(3.3 * SC))
+    tok_gap_px = max(3, int(2.8 * SC))
+
+    hanging_q_count = 0
+    right_circle_count = 0
+    outer_wide_label_count = 0
+    udvash_rects = []
+
+    for (zy0, zy1) in valid_zones:
+        for ci, (cx0_px, cx1_px) in enumerate(col_px_ranges):
+            n_col = norm_s[:, cx0_px:cx1_px].copy()
+            c_col = clean_s[:, cx0_px:cx1_px].copy()
+            r_col = ink_s[:, cx0_px:cx1_px].copy()
+
+            n_dew, c_dew, r_dew, thy = _dewarp_column_arrays(n_col, c_col, r_col)
+            Hc, Wc = c_dew.shape[:2]
+
+            eff_y0, eff_y1 = zy0, zy1
+            sub_banners = _find_column_subbanners_y(r_dew, zy0, zy1)
+            for (by0, by1) in sub_banners:
+                if (by0 - zy0) <= int(42.0 * SC):
+                    eff_y0 = max(eff_y0, by1 + int(4.0 * SC))
+                else:
+                    eff_y1 = min(eff_y1, by0 - int(4.0 * SC))
+                    break
+
+            if (eff_y1 - eff_y0) < int(32.0 * SC):
+                continue
+
+            c_dew[:eff_y0, :] = 0
+            c_dew[eff_y1:, :] = 0
+
+            lines = []
+            for y0, y1 in _horizontal_line_bands(c_dew, eff_y0, eff_y1, min_band_h):
+                info = _line_tokens_info(c_dew, y0, y1, tok_gap_px)
+                if info is not None and info["span"] >= int(16.0 * SC):
+                    lines.append(info)
+
+            if len(lines) < 3:
+                continue
+
+            body_x_samples = []
+            for l in lines:
+                if l["span"] < int(24.0 * SC):
+                    continue
+                if (
+                    int(4.2 * SC) <= l["tw"] <= int(18.0 * SC)
+                    and l["sec_x0"] is not None
+                    and int(10.5 * SC) <= (l["sec_x0"] - l["x0"]) <= int(28.5 * SC)
+                ):
+                    body_x_samples.append(float(l["sec_x0"]))
+                elif l["x0"] < int(Wc * 0.35):
+                    body_x_samples.append(float(l["x0"]))
+
+            if not body_x_samples:
+                continue
+
+            bx_arr = np.array(body_x_samples, dtype=float)
+            bins = np.arange(bx_arr.min() - 4.0, bx_arr.max() + 8.0, 3.0 * SC)
+            if len(bins) >= 2:
+                hist, edges = np.histogram(bx_arr, bins=bins)
+                pk = int(np.argmax(hist))
+                mode_val = 0.5 * (edges[pk] + edges[pk + 1])
+                inliers = [v for v in bx_arr if abs(v - mode_val) <= 5.5 * SC]
+                x_body = float(np.median(inliers)) if inliers else float(np.median(bx_arr))
+            else:
+                x_body = float(np.median(bx_arr))
+
+            q_starts = []
+            for l in lines:
+                hang_dist = x_body - float(l["x0"])
+                if int(10.5 * SC) <= hang_dist <= int(28.5 * SC):
+                    if int(4.2 * SC) <= l["tw"] <= int(18.5 * SC) and l["span"] >= int(32.0 * SC):
+                        if l["sec_x0"] is not None and abs(float(l["sec_x0"]) - x_body) <= int(8.5 * SC):
+                            if not q_starts or (l["y0"] - q_starts[-1]["y0"]) >= int(MIN_START_GAP_PT * SC):
+                                q_starts.append(l)
+                    elif l["tw"] >= int(21.0 * SC):
+                        outer_wide_label_count += 1
+
+            hanging_q_count += len(q_starts)
+
+            for qi, qs in enumerate(q_starts):
+                next_y_lim = q_starts[qi + 1]["y0"] - int(2.0 * SC) if (qi + 1) < len(q_starts) else (eff_y1 - int(2.0 * SC))
+                sub_lines = [l for l in lines if qs["y0"] <= l["y0"] < next_y_lim]
+                if not sub_lines:
+                    continue
+
+                ans_circle = _find_udvash_right_answer_circle(
+                    n_dew, c_dew, qs["y0"] + int(8.0 * SC), next_y_lim
+                )
+
+                if ans_circle is not None:
+                    right_circle_count += 1
+                    c_y0, c_y1, _c_x0 = ans_circle
+                    bot_px = c_y1 + int(2.5 * SC)
+                    for idx_l, l in enumerate(sub_lines):
+                        if l["y0"] <= c_y1 + int(2.0 * SC) and l["y1"] >= c_y0 - int(2.0 * SC):
+                            bot_px = max(bot_px, l["y1"] + int(2.5 * SC))
+                            if idx_l + 1 < len(sub_lines):
+                                nxt_l = sub_lines[idx_l + 1]
+                                if (
+                                    (nxt_l["y0"] - l["y1"]) <= int(11.0 * SC)
+                                    and abs(float(nxt_l["x0"]) - x_body) <= int(7.5 * SC)
+                                    and int(6.5 * SC) <= nxt_l["tw"] <= int(14.0 * SC)
+                                ):
+                                    bot_px = max(bot_px, nxt_l["y1"] + int(2.5 * SC))
+                            break
+                else:
+                    bot_px = qs["y1"] + int(2.5 * SC)
+                    seen_opts = False
+                    for idx_l, l in enumerate(sub_lines[1:], 1):
+                        near_body = abs(float(l["x0"]) - x_body) <= int(8.0 * SC)
+                        is_opt_line = near_body and (int(6.5 * SC) <= l["tw"] <= int(14.8 * SC))
+                        is_sol_line = near_body and (l["tw"] >= int(15.5 * SC))
+                        if not seen_opts:
+                            if is_opt_line:
+                                seen_opts = True
+                                bot_px = l["y1"] + int(2.5 * SC)
+                            elif idx_l <= 4 and (l["y0"] - bot_px) <= int(16.0 * SC):
+                                bot_px = l["y1"] + int(2.5 * SC)
+                            else:
+                                break
+                        else:
+                            if is_sol_line or not is_opt_line:
+                                break
+                            bot_px = l["y1"] + int(2.5 * SC)
+
+                top_px = max(0, qs["y0"] - int(2.5 * SC))
+                bot_px = min(Hc - 1, bot_px)
+                if (bot_px - top_px) < int(MIN_Q_HEIGHT_PT * SC):
+                    continue
+
+                sub_ink = c_dew[top_px:bot_px, :]
+                ys_nz, xs_nz = np.where(sub_ink > 0)
+                if len(ys_nz) < 25:
+                    continue
+
+                bx0_col = max(0, int(xs_nz.min()) - int(3.5 * SC))
+                bx1_col = min(Wc - 1, int(xs_nz.max()) + int(4.5 * SC))
+                top_col = max(0, top_px + int(ys_nz.min()) - int(2.5 * SC))
+                bot_col = min(Hc - 1, top_px + int(ys_nz.max()) + int(3.0 * SC))
+
+                yc_mid = int(0.5 * (top_col + bot_col))
+                shear_shift_x = div_slope * yc_mid if is_two_col else 0.0
+                orig_x0_px = max(4.0, cx0_px + bx0_col + shear_shift_x)
+                orig_x1_px = min(float(w_px - 4), cx0_px + bx1_col + shear_shift_x)
+
+                q_x0_pt = orig_x0_px / SC
+                q_y0_pt = top_col / SC
+                q_x1_pt = orig_x1_px / SC - RIGHT_EDGE_TRIM_PT
+                q_y1_pt = bot_col / SC
+
+                if (q_x1_pt - q_x0_pt) >= 65.0 and (q_y1_pt - q_y0_pt) >= float(MIN_Q_HEIGHT_PT):
+                    q_y0_pt, q_y1_pt = trim_vertical_whitespace(ink_mask, (q_x0_pt, q_x1_pt), q_y0_pt, q_y1_pt, MAX_BLANK_GAP_PT)
+                    rect = fitz.Rect(q_x0_pt, q_y0_pt, q_x1_pt, q_y1_pt)
+                    if not rect.is_empty and not rect.is_infinite:
+                        udvash_rects.append(rect)
+
+    if hanging_q_count >= 3 and (right_circle_count >= 2 or outer_wide_label_count == 0) and len(udvash_rects) >= 3:
+        if xray_logs is not None:
+            for idx_r, r in enumerate(udvash_rects, 1):
+                xray_logs.append({
+                    "পৃষ্ঠা": pno + 1, "কলাম": 1 if (r.x0 + r.x1) * 0.5 < W * 0.5 else 2,
+                    "Y": round(r.y0, 1),
+                    "সিদ্ধান্ত": f"উদ্ভাস ভিশন (#{idx_r})",
+                    "লাইন": f"Box: ({round(r.x0,1)}, {round(r.y0,1)}) -> ({round(r.x1,1)}, {round(r.y1,1)})"
+                })
+        return udvash_rects
+
+    return None
+
+# ==============================================================================
+# ৭.২ আপনার ১০০% সফল ও অক্ষত ACS ইঞ্জিন (sample22.pdf ও sample 2.pdf)
+# ==============================================================================
+def _extract_acs_slanted_page(page, gray_img, ink_mask, W, H, pno, xray_logs=None):
     norm_gray = normalize_shadow_gray(gray_img)
     raw_ink = get_ink_mask(gray_img).astype(np.uint8)
     h_px, w_px = gray_img.shape[:2]
 
     div_x_pt, is_two_col, div_slope, div_fn = trace_slanted_divider(gray_img, W, H)
 
-    # যদি ডিভাইডার ঢালু হয় তবে পুরো পৃষ্ঠাকে সামান্য শিয়ার করে সোজা করে নেওয়া
     if is_two_col and abs(div_slope) > 0.002:
         M_shear = np.float32([[1.0, -div_slope, 0.0], [0.0, 1.0, 0.0]])
         norm_s = cv2.warpAffine(norm_gray, M_shear, (w_px, h_px), borderValue=255)
@@ -842,7 +1186,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
         ink_s = raw_ink.copy()
         div_px = int(round(div_x_pt * SC))
 
-    # খাড়া ডিভাইডার ও লম্বা অনুভূমিক দাগ পরিষ্কার করা
     v_div = cv2.morphologyEx(ink_s, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, int(h_px * 0.10)))))
     clean_s = ink_s & (cv2.dilate(v_div, np.ones((1, 5), np.uint8)) == 0).astype(np.uint8)
     j_h = cv2.dilate(ink_s, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(3.0 * SC)), 1)))
@@ -857,7 +1200,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
     else:
         col_px_ranges = [(margin_edge_px, w_px - margin_edge_px)]
 
-    # পিডিএফে ডিজিটাল টেক্সট লেয়ার থাকলে তার শব্দগুলো নেওয়া
     pdf_words = [(w[0], w[1], w[2], w[3], w[4].strip()) for w in page.get_text("words") if w[4].strip()]
     pdf_lines_all = group_words_into_lines(pdf_words)
 
@@ -871,16 +1213,13 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
         c_col = clean_s[:, cx0_px:cx1_px].copy()
         r_col = ink_s[:, cx0_px:cx1_px].copy()
 
-        # কলামের ডান প্রান্তের কালো বর্ডার থাকলে তা মুছে ফেলা
         if (not is_two_col or ci == 1) and c_col.shape[1] > int(20 * SC):
             c_col[:, -int(10 * SC):] = 0
 
-        # কলামের বাঁকা লাইনগুলো সোজা (Dewarp) করা
         n_dew, c_dew, r_dew, thy = _dewarp_column_arrays(n_col, c_col, r_col)
         hdr_px = _detect_header_bottom_px(r_dew)
         c_dew[:hdr_px, :] = 0
 
-        # র‍্যানস্যাক মার্জিন বের করার জন্য কলামের সব লাইন শনাক্ত করা
         raw_lines = []
         for y0, y1 in _horizontal_line_bands(c_dew, hdr_px, h_px - int(24 * SC), min_band_h):
             sp = _first_token_span(c_dew, y0, y1, tok_gap_px)
@@ -892,7 +1231,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
 
         _, _, mx_fn = _fit_slanted_margin_ransac(raw_lines)
 
-        # ঢালু মার্জিন বরাবর স্ট্রিপ কেটে নেওয়া (বামে ৩ পয়েন্ট থেকে ডানে ৩২ পয়েন্ট পর্যন্ত)
         x_lo, x_hi = -int(3.2 * SC), int(32.0 * SC)
         strip_w = x_hi - x_lo
         Si = np.zeros((h_px, strip_w), dtype=np.uint8)
@@ -907,17 +1245,13 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
                 Sg[y_r, s_x - a_x:e_x - a_x] = n_dew[y_r, s_x:e_x]
         Si[:hdr_px, :] = 0
 
-        # স্ট্রিপের ভেতর থেকে মার্জিন মার্কারগুলো (প্রশ্ন নম্বর বনাম 'উত্তর:'/'ব্যাখ্যা:') আলাদা করা
         col_markers = []
         max_lead_px = int(8.5 * SC)
         max_num_tw_px = int(19.5 * SC)
 
         for y0, y1 in _horizontal_line_bands(Si, hdr_px, h_px - int(22 * SC), min_band_h):
             xs = np.where(Si[y0:y1, :].sum(axis=0) > 0)[0]
-            if len(xs) == 0:
-                continue
-            if int(xs[0]) > max_lead_px:
-                # এটি মার্জিন থেকে ডানে সরে থাকা ইনডেন্টেড লাইন (যেমন অপশন সারি)
+            if len(xs) == 0 or int(xs[0]) > max_lead_px:
                 continue
 
             sp = _first_token_span(Si, y0, y1, tok_gap_px)
@@ -925,12 +1259,10 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
                 continue
             tw = sp[1] - sp[0] + 1
 
-            # পুরো কলামে ওই লাইনের প্রশস্ততা ও অপশন বৃত্ত চেক করা
             full_xs = np.where(c_dew[y0:y1, :].sum(axis=0) > 0)[0]
             line_span_px = (int(full_xs[-1]) - int(full_xs[0])) if len(full_xs) > 0 else tw
 
-            # পিডিএফ টেক্সট লেয়ারে ওই স্থানে কোনো সমাধান ট্যাগ বা প্রশ্ন ট্যাগ আছে কি না
-            y0_pt, y1_pt = y0 / SC, y1 / SC
+            y0_pt = y0 / SC
             cx0_pt, cx1_pt = cx0_px / SC, cx1_px / SC
             matching_pdf_ln = [
                 ln for ln in pdf_lines_all
@@ -941,7 +1273,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
             if pdf_line_txt and HEADER_NOISE_RE.search(pdf_line_txt):
                 continue
 
-            # যদি পিডিএফ টেক্সট লেয়ারে বা টোকেন প্রস্থে স্পষ্ট সমাধান ট্যাগ থাকে
             is_sol_by_tag = False
             if matching_pdf_ln:
                 is_sol_by_tag, _ = line_has_solution_marker(matching_pdf_ln[0], pdf_line_txt, cx0_pt + MAX_SOL_X_OFFSET)
@@ -953,10 +1284,8 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
                 })
                 continue
 
-            # ওসিআর দিয়ে সংখ্যা পড়ার চেষ্টা
             read_res = _ocr_digits_voting(Sg, y0, y1, sp[0]) if tw <= int(24.0 * SC) else None
 
-            # যদি পিডিএফ টেক্সট লেয়ারে প্রশ্ন নম্বর থাকে
             if read_res is None and matching_pdf_ln:
                 t0_pdf = matching_pdf_ln[0][0][4].strip("([{|! ")
                 m_p = NUM_RE.match(t0_pdf)
@@ -971,13 +1300,11 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
                     "kind": "num", "num": read_res[0], "conf": read_res[1], "guessed": False
                 })
             elif tw <= max_num_tw_px and line_span_px >= int(42.0 * SC):
-                # প্রস্থ একদম প্রশ্ন নম্বরের মতো ছোট (যেমন '11.' বা '15.'), কিন্তু ওসিআর মিস করেছে -> সিকোয়েন্স রিকভারির জন্য 'cand'
                 col_markers.append({
                     "col": ci, "y0": y0, "y1": y1, "tw": tw,
                     "kind": "cand", "num": None, "conf": 0, "guessed": False
                 })
             else:
-                # চওড়া মার্জিন টোকেন (যেমন 'উত্তর:', 'ব্যাখ্যা:', 'সমাধান:', 'বিকল্প:') -> 'label'
                 col_markers.append({
                     "col": ci, "y0": y0, "y1": y1, "tw": tw,
                     "kind": "label", "num": None, "conf": 0, "guessed": False
@@ -993,14 +1320,10 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
     if not all_markers:
         return []
 
-    # ==========================================================================
-    # সিকোয়েন্স ফিল্টার ও মিসিং প্রশ্ন নম্বর রিকভারি (Sequence Recovery)
-    # ==========================================================================
     all_markers.sort(key=lambda m: (m["col"], m["y0"]))
     numbered = [m for m in all_markers if m["kind"] == "num" and m["num"] is not None]
 
     if numbered:
-        # দীর্ঘতম ক্রমবর্ধমান প্রশ্ন নম্বরের চেইন (Longest Increasing Subsequence) বের করা
         n_len = len(numbered)
         dp = [(1, -1)] * n_len
         for i in range(n_len):
@@ -1022,7 +1345,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
 
         kept = [m for m in all_markers if m["kind"] == "num"]
 
-        # ১. দুটি শনাক্ত হওয়া প্রশ্নের মাঝখানে কোনো নম্বর মিস হলে (যেমন 13 এবং 15 এর মাঝে 14) তা 'cand' থেকে পূরণ করা
         for a_m, b_m in zip(kept, kept[1:]):
             miss = list(range(a_m["num"] + 1, b_m["num"]))
             if not miss:
@@ -1036,7 +1358,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
                 m_cand["num"] = k_num
                 m_cand["guessed"] = True
 
-        # ২. প্রথম শনাক্ত হওয়া প্রশ্নের আগে কোনো 'cand' থাকলে (যেমন 12 এর আগে 11) তা পূরণ করা
         first_m = kept[0]
         lead_cands = [
             m for m in all_markers
@@ -1049,7 +1370,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
             m_cand["num"] = k_num
             m_cand["guessed"] = True
 
-        # ৩. শেষ শনাক্ত হওয়া প্রশ্নের পরে কোনো 'cand' থাকলে (যেমন 14 এর পরে 15) তা পূরণ করা
         kept = [m for m in all_markers if m["kind"] == "num"]
         last_m = kept[-1]
         tail_cands = [
@@ -1063,7 +1383,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
             m_cand["num"] = k_num
             m_cand["guessed"] = True
     else:
-        # যদি ওসিআর অনুপস্থিত থাকে, তবে যেসব 'cand'-এর নিচে অপশন ও পরে 'label' ('উত্তর:') আছে সেগুলোকে প্রশ্ন হিসেবে নেওয়া
         for idx_m, m in enumerate(all_markers):
             if m["kind"] == "cand":
                 nxt_in_col = [x for x in all_markers[idx_m + 1:] if x["col"] == m["col"]]
@@ -1071,9 +1390,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
                     m["kind"] = "num"
                     m["guessed"] = True
 
-    # ==========================================================================
-    # প্রতিটি প্রশ্নের শুরু থেকে 'উত্তর:'/'ব্যাখ্যা:' লেবেলের ঠিক আগ পর্যন্ত বক্স তৈরি
-    # ==========================================================================
     page_rects = []
     for c_info in col_data_list:
         ci = c_info["ci"]
@@ -1086,11 +1402,9 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
         q_markers = [m for m in c_markers if m["kind"] == "num"]
 
         for qm in q_markers:
-            # এই প্রশ্নের নিচে প্রথম যে 'label' ('উত্তর:' বা 'ব্যাখ্যা:') বা পরবর্তী প্রশ্ন আছে, তার ঠিক উপরেই বক্স থামবে
             after_m = [m for m in c_markers if m["y0"] > qm["y0"] + int(4.0 * SC)]
             stop_y_px = after_m[0]["y0"] - int(2.0 * SC) if after_m else (Hc - int(15.0 * SC))
 
-            # বাঁকা পাতার কোণায় যদি ৪র্থ অপশনটি 'উত্তর:' লেবেলের চেয়ে সামান্য নিচে নেমে গিয়ে থাকে (যেমন Q27), তবে ডান পাশের কালি দেখে তা রক্ষা করা
             if after_m and after_m[0]["kind"] == "label":
                 lb = after_m[0]
                 right_zone_x0 = int(Wc * 0.55)
@@ -1115,7 +1429,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
             if bot_px - top_px < int(MIN_Q_HEIGHT_PT * SC):
                 continue
 
-            # বক্সের ভেতরের প্রকৃত লেখার সীমা অনুযায়ী উপরের, নিচের ও পাশের সাদা অংশ ছাঁটাই
             sub_ink = c_dew[top_px:bot_px, :]
             ys_nz, xs_nz = np.where(sub_ink > 0)
             if len(ys_nz) < 25:
@@ -1126,7 +1439,6 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
             top_col = max(0, top_px + int(ys_nz.min()) - int(3.0 * SC))
             bot_col = min(Hc - 1, top_px + int(ys_nz.max()) + int(3.5 * SC))
 
-            # ডিওয়ার্প ও শিয়ার কোঅর্ডিনেট থেকে মূল পিডিএফ পয়েন্টে রূপান্তর
             yc_mid = int(0.5 * (top_col + bot_col))
             ang_mid = float(thy[min(Hc - 1, max(0, yc_mid))])
             dy_pad = abs(ang_mid) * (Wc * 0.35)
@@ -1151,11 +1463,17 @@ def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xr
                         xray_logs.append({
                             "পৃষ্ঠা": pno + 1, "কলাম": ci + 1,
                             "Y": round(q_y0_pt, 1),
-                            "সিদ্ধান্ত": f"শনাক্ত (প্রশ্ন #{qm['num'] if qm['num'] else '?'})",
+                            "সিদ্ধান্ত": f"ACS ভিশন (#{qm['num'] if qm['num'] else '?'})",
                             "লাইন": f"Box: ({round(q_x0_pt,1)}, {round(q_y0_pt,1)}) -> ({round(q_x1_pt,1)}, {round(q_y1_pt,1)})"
                         })
 
     return page_rects
+
+def extract_page_questions_vision_hybrid(page, gray_img, ink_mask, W, H, pno, xray_logs=None):
+    udvash_res = _try_extract_udvash_page(page, gray_img, ink_mask, W, H, pno, xray_logs=xray_logs)
+    if udvash_res is not None:
+        return udvash_res
+    return _extract_acs_slanted_page(page, gray_img, ink_mask, W, H, pno, xray_logs=xray_logs)
 
 # ==============================================================================
 # ৮. স্লাইড মোড: বক্সে ঘেরা প্রশ্ন শনাক্ত, Sol^n ও ফাঁকা জায়গা ছাঁটাই
@@ -1289,7 +1607,9 @@ def detect_boxed_questions(page, gray, ink, W, H):
             break
     return _order_rects_reading([b[0] for b in boxes])
 
-# ৯. প্রোগ্রেস কার্ড ও মূল এক্সট্রাকশন পাইপলাইন
+# ==============================================================================
+# ৯. ক্যাশ-মুক্ত YOLO লোডার ও হাইব্রিড এক্সট্রাকশন পাইপলাইন
+# ==============================================================================
 def render_progress_card(placeholder, current_idx, total_pages, page_no, found_count, stage_label):
     pct = int(round((current_idx / max(1, total_pages)) * 100))
     placeholder.markdown(f"""
@@ -1312,26 +1632,41 @@ def render_progress_card(placeholder, current_idx, total_pages, page_no, found_c
     """, unsafe_allow_html=True)
 
 @st.cache_resource
-def load_trained_yolo_model():
-    """ফোল্ডারে থাকা ট্রেইনড question_detector.pt মডেলটি লোড করে।"""
-    model_path = "question_detector.pt"
-    if not os.path.exists(model_path):
-        return None, "ফোল্ডারে question_detector.pt ফাইলটি পাওয়া যায়নি!"
+def _load_yolo_cached(abs_path, file_mtime, file_size):
+    """ফাইলের মডিফিকেশন টাইম ও সাইজসহ লোড করে যেন নতুন ফাইল দিলে কখনো পুরোনো ক্যাশ আটকে না থাকে।"""
+    from ultralytics import YOLO
+    return YOLO(abs_path)
+
+def get_active_yolo_model():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, "question_detector.pt"),
+        os.path.abspath("question_detector.pt"),
+        os.path.join(base_dir, "runs", "detect", "yolo_runs", "q_model", "weights", "best.pt"),
+    ]
+    found_path = next((p for p in candidates if os.path.exists(p)), None)
+    if not found_path:
+        return None, "ফোল্ডারে question_detector.pt পাওয়া যায়নি!"
     try:
-        from ultralytics import YOLO
-        return YOLO(model_path), None
+        mtime = os.path.getmtime(found_path)
+        fsize = os.path.getsize(found_path)
+        model = _load_yolo_cached(found_path, mtime, fsize)
+        size_mb = fsize / (1024 * 1024)
+        return model, f"সক্রিয় ({os.path.basename(found_path)} • {size_mb:.1f} MB)"
     except Exception as e:
-        return None, f"ultralytics লাইব্রেরি লোড হয়নি ({e})। টার্মিনালে pip install ultralytics রান করুন।"
+        return None, f"লোড ত্রুটি: {e}"
 
 def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray_logs=None):
-    """ট্রেইন করা YOLOv8 মডেল দিয়ে পাতার প্রশ্নগুলো শনাক্ত করে।"""
-    yolo_sc = 2.0  # ডেটাসেট তৈরির সময় ব্যবহৃত স্কেলের সাথে শতভাগ মিল রাখা হয়েছে
+    """ট্রেইন করা YOLOv8 মডেল দিয়ে প্রশ্ন বের করে এবং কালি ও মার্জিন অনুযায়ী নিখুঁতভাবে বক্স স্ন্যাপ করে।"""
+    yolo_sc = 2.0
     pix = page.get_pixmap(matrix=fitz.Matrix(yolo_sc, yolo_sc), alpha=False)
     img_rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-    preds = yolo_model.predict(source=img_bgr, conf=0.22, iou=0.45, imgsz=1024, verbose=False)
+    # ১৭টি পাতায় ট্রেইন করা মডেলের Recall বাড়াতে conf=0.14 দেওয়া হয়েছে
+    preds = yolo_model.predict(source=img_bgr, conf=0.14, iou=0.40, imgsz=1024, verbose=False)
 
+    h_px, w_px = ink_mask.shape[:2]
     raw_boxes = []
     for r in preds:
         for box in r.boxes:
@@ -1339,23 +1674,34 @@ def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray
             conf = float(box.conf[0])
             bw, bh = x1 - x0, y1 - y0
 
-            # অস্বাভাবিক ছোট বা পুরো পাতা জুড়ে থাকা ভুয়া বক্স বাদ দেওয়া
-            if bw < 48.0 or bh < float(MIN_Q_HEIGHT_PT):
+            if bw < 50.0 or bh < float(MIN_Q_HEIGHT_PT):
                 continue
-            if bw > W * 0.88 and bh > H * 0.72:
+            if bw > W * 0.72 or bh > H * 0.55:
+                continue
+            if y0 < 30.0 or y1 > (H - 25.0):
                 continue
 
-            x0 = max(2.0, x0)
-            y0 = max(2.0, y0)
-            x1 = min(W - 2.0, x1 - RIGHT_EDGE_TRIM_PT)
-            y1 = min(H - 2.0, y1)
-            if x1 - x0 >= 48.0 and y1 - y0 >= float(MIN_Q_HEIGHT_PT):
+            # দুই কলামের মাঝখানের বিভাজক রেখা এপার-ওপার কেটে গেলে তা বাদ দেওয়া
+            if x0 < (W * 0.42) and x1 > (W * 0.58):
+                continue
+
+            x0 = max(4.0, x0)
+            y0 = max(4.0, y0)
+            x1 = min(W - 4.0, x1 - RIGHT_EDGE_TRIM_PT)
+            y1 = min(H - 4.0, y1)
+
+            # বক্সের ভেতরে আসলেই লেখার কালি আছে কি না পরীক্ষা করা
+            sub_ink = ink_mask[max(0, int(y0 * SC)):min(h_px, int(y1 * SC)), max(0, int(x0 * SC)):min(w_px, int(x1 * SC))]
+            if sub_ink.size == 0 or float(sub_ink.mean()) < 0.008:
+                continue
+
+            y0, y1 = trim_vertical_whitespace(ink_mask, (x0, x1), y0, y1, MAX_BLANK_GAP_PT)
+            if (x1 - x0) >= 50.0 and (y1 - y0) >= float(MIN_Q_HEIGHT_PT):
                 raw_boxes.append((x0, y0, x1, y1, conf))
 
     if not raw_boxes:
         return []
 
-    # একই প্রশ্নের ওপর একাধিক ডুপ্লিকেট বক্স থাকলে সেরা কনফিডেন্সের বক্সটি রাখা
     raw_boxes.sort(key=lambda b: b[4], reverse=True)
     kept = []
     for b in raw_boxes:
@@ -1367,13 +1713,12 @@ def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray
             kx0, ky0, kx1, ky1, _ = kb
             inter_x = max(0.0, min(x1, kx1) - max(x0, kx0))
             inter_y = max(0.0, min(y1, ky1) - max(y0, ky0))
-            if inter_x / max(1.0, min(bw, kx1 - kx0)) > 0.45 and inter_y / max(1.0, min(bh, ky1 - ky0)) > 0.35:
+            if inter_x / max(1.0, min(bw, kx1 - kx0)) > 0.40 and inter_y / max(1.0, min(bh, ky1 - ky0)) > 0.30:
                 is_dup = True
                 break
         if not is_dup:
             kept.append(b)
 
-    # বাম কলাম ও ডান কলাম অনুযায়ী উপর থেকে নিচে সাজানো
     kept.sort(key=lambda b: (0 if ((b[0] + b[2]) * 0.5 < W * 0.5) else 1, b[1]))
 
     page_rects = []
@@ -1392,16 +1737,44 @@ def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray
 
     return page_rects
 
+def _merge_vision_and_yolo_rects(vision_rects, yolo_rects, W):
+    """
+    ভিশন ইঞ্জিন (ACS/উদ্ভাস) এবং YOLO AI মডেলের বক্সগুলোর সেরা সমন্বয় করে:
+    ১. ভিশন ইঞ্জিন যেখানে নিখুঁত প্রশ্ন পেয়েছে সেগুলো রাখে।
+    ২. যে প্রশ্নগুলো ভিশন ইঞ্জিন মিস করেছে কিন্তু YOLO ধরেছে, সেগুলোও যোগ করে!
+    """
+    if not vision_rects:
+        return yolo_rects, len(yolo_rects), 0
+    if not yolo_rects:
+        return vision_rects, 0, len(vision_rects)
+
+    merged = list(vision_rects)
+    added_from_yolo = 0
+    for yr in yolo_rects:
+        y_col = 0 if (yr.x0 + yr.x1) * 0.5 < W * 0.5 else 1
+        overlaps = False
+        for vr in vision_rects:
+            v_col = 0 if (vr.x0 + vr.x1) * 0.5 < W * 0.5 else 1
+            if y_col == v_col:
+                inter_y = max(0.0, min(yr.y1, vr.y1) - max(yr.y0, vr.y0))
+                if inter_y / max(1.0, min(yr.height, vr.height)) > 0.25 or abs(yr.y0 - vr.y0) < 16.0:
+                    overlaps = True
+                    break
+        if not overlaps:
+            merged.append(yr)
+            added_from_yolo += 1
+
+    merged.sort(key=lambda r: (0 if (r.x0 + r.x1) * 0.5 < W * 0.5 else 1, r.y0))
+    return merged, added_from_yolo, len(vision_rects)
+
 def extract_questions_from_pdf(src_doc, page_indices, progress_slot, collect_xray=False):
     questions = []
     xray_logs = []
     total_to_scan = len(page_indices)
 
-    yolo_model, yolo_err = load_trained_yolo_model()
-    if yolo_err:
-        st.warning(f"⚠️ এআই মডেল বার্তা: {yolo_err}")
-    else:
-        st.toast("🧠 আপনার ট্রেইনড YOLO AI মডেল সক্রিয় আছে!")
+    yolo_model, yolo_status = get_active_yolo_model()
+    yolo_total_hits = 0
+    vision_total_hits = 0
 
     for idx, pno in enumerate(page_indices):
         render_progress_card(
@@ -1426,19 +1799,23 @@ def extract_questions_from_pdf(src_doc, page_indices, progress_slot, collect_xra
                 continue
 
         log_target = xray_logs if collect_xray else None
-        page_rects = []
 
-        # ১. প্রথমে আপনার ট্রেইনড YOLO AI মডেল দিয়ে প্রশ্ন খোঁজা হবে
+        # ১. ভিশন ইঞ্জিন (উদ্ভাস + ACS) চালানো
+        vision_rects = extract_page_questions_vision_hybrid(
+            page, gray, ink, W, H, pno, xray_logs=log_target
+        )
+
+        # ২. ট্রেইনড YOLO AI মডেল চালানো
+        yolo_rects = []
         if yolo_model is not None:
-            page_rects = extract_page_questions_with_yolo(
+            yolo_rects = extract_page_questions_with_yolo(
                 yolo_model, page, ink, W, H, pno, xray_logs=log_target
             )
 
-        # ২. যদি কোনো পাতায় YOLO বক্স না পায়, তবে ফলব্যাক হিসেবে ভিশন ইঞ্জিন কাজ করবে
-        if not page_rects:
-            page_rects = extract_page_questions_vision_hybrid(
-                page, gray, ink, W, H, pno, xray_logs=log_target
-            )
+        # ৩. দুটির ফিউশন (যাতে কোনো প্রশ্নই বাদ না যায়)
+        page_rects, y_cnt, v_cnt = _merge_vision_and_yolo_rects(vision_rects, yolo_rects, W)
+        yolo_total_hits += len(yolo_rects)
+        vision_total_hits += v_cnt
 
         for r in page_rects:
             questions.append((pno, r))
@@ -1449,6 +1826,7 @@ def extract_questions_from_pdf(src_doc, page_indices, progress_slot, collect_xra
         )
 
     st.session_state["rv_xray_logs"] = xray_logs
+    st.info(f"🧠 **YOLO মডেল:** {yolo_status} | **YOLO কাঁচা বক্স:** {yolo_total_hits}টি | **ভিশন ইঞ্জিন বক্স:** {vision_total_hits}টি | **চূড়ান্ত প্রশ্ন:** {len(questions)}টি")
     return questions
 
 def build_practice_pdf(src_doc, questions, custom_gaps=None):
@@ -1518,6 +1896,8 @@ def build_practice_pdf(src_doc, questions, custom_gaps=None):
 # ৯.৯ বাহ্যিক canvas_editor.html লোডার ও বক্স এডিটর থেকে YOLO ডেটাসেট অটো-সেভার
 # ==============================================================================
 def save_corrected_boxes_to_yolo_dataset(raw_pdf, new_df):
+    """বক্স এডিটরে সেভ চাপলে লোকাল ফোল্ডার এবং গিটহাবের yolo_dataset ফোল্ডারে সরাসরি সেভ করে।"""
+    pushed_pages = 0
     try:
         img_dir = os.path.join("yolo_dataset", "images")
         lbl_dir = os.path.join("yolo_dataset", "labels")
@@ -1546,10 +1926,25 @@ def save_corrected_boxes_to_yolo_dataset(raw_pdf, new_df):
                 yolo_lines.append(f"0 {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
 
             stamp = f"edited_p{p_num}_{len(raw_pdf)}"
-            cv2.imwrite(os.path.join(img_dir, f"{stamp}.jpg"), img_bgr)
-            with open(os.path.join(lbl_dir, f"{stamp}.txt"), "w", encoding="utf-8") as f:
-                f.write("\n".join(yolo_lines))
+            lbl_text = "\n".join(yolo_lines) + "\n"
+
+            # ১. লোকালে সেভ
+            img_rel_path = f"yolo_dataset/images/{stamp}.jpg"
+            lbl_rel_path = f"yolo_dataset/labels/{stamp}.txt"
+            cv2.imwrite(img_rel_path, img_bgr)
+            with open(lbl_rel_path, "w", encoding="utf-8") as f:
+                f.write(lbl_text)
+
+            # ২. সরাসরি গিটহাবে পুশ (জিপ করার ঝামেলা ছাড়াই)
+            ok_jpg, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if ok_jpg:
+                push_binary_file_to_github(img_rel_path, buf.tobytes(), f"Add training image {stamp}.jpg")
+                ok_lbl, _ = push_file_to_github(lbl_rel_path, lbl_text, f"Add training labels {stamp}.txt")
+                if ok_lbl:
+                    pushed_pages += 1
         doc.close()
+        if pushed_pages > 0:
+            st.toast(f"☁️ {pushed_pages}টি পৃষ্ঠার ডেটা সরাসরি গিটহাবে yolo_dataset-এ সেভ হয়েছে!")
     except Exception:
         pass
 

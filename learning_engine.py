@@ -688,3 +688,96 @@ def analyze_user_corrections(raw_pdf, old_rows_df, new_rows_df):
 
     doc.close()
     return suggestions
+
+# ==============================================================================
+# বাইনারি ফাইল (ছবি) গিটহাবে আপলোড এবং ১-ক্লিকে ক্লাউড YOLO ট্রেইনিং ট্রিগার
+# ==============================================================================
+def push_binary_file_to_github(filepath, file_bytes, commit_message):
+    """বক্স এডিটরের ছবি (.jpg) সরাসরি গিটহাবের yolo_dataset ফোল্ডারে সেভ করে।"""
+    token, repo, branch = _get_github_credentials()
+    if not token:
+        return False, "গিটহাব টোকেন পাওয়া যায়নি।"
+
+    api_url = f"https://api.github.com/repos/{repo}/contents/{filepath}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+    try:
+        sha = None
+        get_resp = requests.get(api_url, headers=headers, params={"ref": branch}, timeout=12)
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+
+        encoded_content = base64.b64encode(file_bytes).decode("ascii")
+        payload = {
+            "message": commit_message,
+            "content": encoded_content,
+            "branch": branch
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_resp = requests.put(api_url, headers=headers, json=payload, timeout=20)
+        if put_resp.status_code in (200, 201):
+            return True, "গিটহাবে সেভ হয়েছে!"
+        err_msg = put_resp.json().get("message", f"HTTP {put_resp.status_code}")
+        return False, f"গিটহাব এপিআই ত্রুটি: {err_msg}"
+    except Exception as e:
+        return False, f"গিটহাব সংযোগ ত্রুটি: {e}"
+
+
+def trigger_github_yolo_training():
+    """ওয়েব অ্যাপ থেকে ১ ক্লিকে গিটহাব অ্যাকশনস (GitHub Actions) ট্রেইনিং চালু করে।"""
+    token, repo, branch = _get_github_credentials()
+    if not token:
+        return False, "গিটহাব টোকেন পাওয়া যায়নি! Streamlit Secrets-এ GITHUB_TOKEN যোগ করুন।"
+
+    api_url = f"https://api.github.com/repos/{repo}/actions/workflows/train_yolo.yml/dispatches"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    try:
+        resp = requests.post(api_url, headers=headers, json={"ref": branch}, timeout=12)
+        if resp.status_code == 204:
+            return True, "🚀 গিটহাব ক্লাউডে YOLO মডেল ট্রেইনিং শুরু হয়েছে! সম্পন্ন হলে question_detector.pt অটো-আপডেট হয়ে যাবে।"
+        err = resp.json().get("message", f"HTTP {resp.status_code}") if resp.text else f"HTTP {resp.status_code}"
+        return False, f"ট্রিগার ত্রুটি ({err})। টোকেনে 'workflow' পারমিশন এবং '.github/workflows/train_yolo.yml' ফাইলটি আছে কি না দেখুন।"
+    except Exception as e:
+        return False, f"সংযোগ ত্রুটি: {e}"
+
+
+def get_github_training_status():
+    """গিটহাব ক্লাউডে চলমান YOLO ট্রেইনিংয়ের বর্তমান অবস্থা জানায়।"""
+    token, repo, _ = _get_github_credentials()
+    if not token:
+        return "গিটহাব টোকেন নেই"
+
+    api_url = f"https://api.github.com/repos/{repo}/actions/workflows/train_yolo.yml/runs"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    try:
+        resp = requests.get(api_url, headers=headers, params={"per_page": 1}, timeout=10)
+        if resp.status_code == 200:
+            runs = resp.json().get("workflow_runs", [])
+            if not runs:
+                return "এখনো কোনো ক্লাউড ট্রেইনিং চালানো হয়নি।"
+            r = runs[0]
+            status = r.get("status", "")
+            conclusion = r.get("conclusion", "")
+            if status in ("queued", "in_progress"):
+                return "⏳ ক্লাউডে মডেল ট্রেইনিং চলছে..."
+            if status == "completed":
+                if conclusion == "success":
+                    return "✅ সর্বশেষ ট্রেইনিং সফল ও question_detector.pt আপডেটেড!"
+                return f"❌ সর্বশেষ ট্রেইনিং ব্যর্থ ({conclusion})"
+        return "স্ট্যাটাস জানা যায়নি"
+    except Exception:
+        return "সংযোগ ত্রুটি"
