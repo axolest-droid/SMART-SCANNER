@@ -307,6 +307,14 @@ def _get_github_credentials():
     return token.strip() if token else None, repo.strip(), branch.strip()
 
 
+def repo_is_default():
+    """GITHUB_REPO secret সেট না থাকলে True (মানে অ্যাপ ভুল ডিফল্ট রিপোতে লিখছে)।"""
+    try:
+        return "GITHUB_REPO" not in st.secrets
+    except Exception:
+        return True
+
+
 def verify_admin_pin(input_pin):
     secret_pin = None
     try:
@@ -730,23 +738,49 @@ def push_binary_file_to_github(filepath, file_bytes, commit_message):
 
 
 def trigger_github_yolo_training():
-    """ওয়েব অ্যাপ থেকে ১ ক্লিকে গিটহাব অ্যাকশনস (GitHub Actions) ট্রেইনিং চালু করে।"""
+    """ওয়েব অ্যাপ থেকে ১ ক্লিকে গিটহাব অ্যাকশনস (GitHub Actions) ট্রেইনিং চালু করে।"""
     token, repo, branch = _get_github_credentials()
     if not token:
-        return False, "গিটহাব টোকেন পাওয়া যায়নি! Streamlit Secrets-এ GITHUB_TOKEN যোগ করুন।"
+        return False, "গিটহাব টোকেন পাওয়া যায়নি! Streamlit Secrets-এ GITHUB_TOKEN যোগ করুন।"
 
-    api_url = f"https://api.github.com/repos/{repo}/actions/workflows/train_yolo.yml/dispatches"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
+    where = f"repo=`{repo}`, branch=`{branch}`"
+    if repo_is_default():
+        where += " ⚠️ (Secrets-এ GITHUB_REPO নেই, তাই ডিফল্ট রিপো ব্যবহার হচ্ছে!)"
+
     try:
+        # ধাপ ১: রিপোজিটরি টোকেন দিয়ে দেখা যাচ্ছে কি না
+        r_repo = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=12)
+        if r_repo.status_code == 404:
+            return False, (f"রিপোজিটরি `{repo}` পাওয়া যায়নি বা টোকেনের এক্সেস নেই। {where}। "
+                           "Secrets-এ GITHUB_REPO = \"আপনার-ইউজার/রিপোর-নাম\" দিন এবং টোকেনে এই রিপো সিলেক্ট করুন।")
+        if r_repo.status_code == 401:
+            return False, "টোকেন ভুল বা মেয়াদোত্তীর্ণ (401 Bad credentials)।"
+        default_branch = r_repo.json().get("default_branch", branch)
+        if default_branch != branch:
+            branch = default_branch  # ভুল ব্রাঞ্চ থাকলে রিপোর ডিফল্ট ব্রাঞ্চ ধরা হবে
+
+        # ধাপ ২: ওয়ার্কফ্লো ফাইল আদৌ আছে কি না
+        r_wf = requests.get(f"https://api.github.com/repos/{repo}/actions/workflows/train_yolo.yml",
+                            headers=headers, timeout=12)
+        if r_wf.status_code == 404:
+            return False, (f"`{repo}`-তে .github/workflows/train_yolo.yml ফাইলটি নেই (ব্রাঞ্চ `{branch}`)। "
+                           "ফাইলটি GitHub-এ আপলোড/কমিট করুন।")
+
+        # ধাপ ৩: ট্রিগার
+        api_url = f"https://api.github.com/repos/{repo}/actions/workflows/train_yolo.yml/dispatches"
         resp = requests.post(api_url, headers=headers, json={"ref": branch}, timeout=12)
         if resp.status_code == 204:
-            return True, "🚀 গিটহাব ক্লাউডে YOLO মডেল ট্রেইনিং শুরু হয়েছে! সম্পন্ন হলে question_detector.pt অটো-আপডেট হয়ে যাবে।"
+            return True, "🚀 গিটহাব ক্লাউডে YOLO মডেল ট্রেইনিং শুরু হয়েছে! সম্পন্ন হলে question_detector.pt অটো-আপডেট হয়ে যাবে।"
         err = resp.json().get("message", f"HTTP {resp.status_code}") if resp.text else f"HTTP {resp.status_code}"
-        return False, f"ট্রিগার ত্রুটি ({err})। টোকেনে 'workflow' পারমিশন এবং '.github/workflows/train_yolo.yml' ফাইলটি আছে কি না দেখুন।"
+        hint = ""
+        if resp.status_code in (403, 404):
+            hint = " টোকেনে Actions: Read and write (fine-grained) অথবা 'repo' + 'workflow' (classic) পারমিশন লাগবে।"
+        return False, f"ট্রিগার ত্রুটি ({resp.status_code}: {err}). {where}.{hint}"
     except Exception as e:
         return False, f"সংযোগ ত্রুটি: {e}"
 

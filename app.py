@@ -13,6 +13,7 @@ AI INSTRUCTION MANUAL (যেকোনো এআই বটের জন্য �
 """
 
 import os
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # tesseract shared CPU-তে আটকে যাওয়া ঠেকায়
 import re
 import time
 import glob
@@ -796,6 +797,8 @@ def _ocr_digits_voting(strip_gray, y0, y1, x_start):
     pad_x = max(2, int(1.8 * SC))
 
     for w_px in widths_px:
+        if votes and max(votes.values()) >= 150:
+            break  # যথেষ্ট নিশ্চিত হলে বাকি ঘুরে আর সময় নষ্ট নয়
         crop = strip_gray[max(0, y0 - pad_y):min(strip_gray.shape[0], y1 + pad_y), max(0, x_start - pad_x):min(strip_gray.shape[1], x_start + w_px)]
         if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
             continue
@@ -804,13 +807,14 @@ def _ocr_digits_voting(strip_gray, y0, y1, x_start):
         _, otsu = cv2.threshold(bordered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         eroded = cv2.erode(otsu, np.ones((2, 2), np.uint8))
 
-        for variant in (bordered, otsu, eroded):
+        for variant in (otsu, bordered, eroded):
             for psm in (7, 8):
                 try:
                     d = pytesseract.image_to_data(
                         variant,
                         config=f"--psm {psm} -c tessedit_char_whitelist=0123456789.",
-                        output_type=pytesseract.Output.DICT
+                        output_type=pytesseract.Output.DICT,
+                        timeout=6
                     )
                     for txt, cf in zip(d["text"], d["conf"]):
                         t = txt.strip()
@@ -1898,6 +1902,7 @@ def build_practice_pdf(src_doc, questions, custom_gaps=None):
 def save_corrected_boxes_to_yolo_dataset(raw_pdf, new_df):
     """বক্স এডিটরে সেভ চাপলে লোকাল ফোল্ডার এবং গিটহাবের yolo_dataset ফোল্ডারে সরাসরি সেভ করে।"""
     pushed_pages = 0
+    push_errors = []
     try:
         img_dir = os.path.join("yolo_dataset", "images")
         lbl_dir = os.path.join("yolo_dataset", "labels")
@@ -1935,18 +1940,25 @@ def save_corrected_boxes_to_yolo_dataset(raw_pdf, new_df):
             with open(lbl_rel_path, "w", encoding="utf-8") as f:
                 f.write(lbl_text)
 
-            # ২. সরাসরি গিটহাবে পুশ (জিপ করার ঝামেলা ছাড়াই)
+            # ২. সরাসরি গিটহাবে পুশ
             ok_jpg, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if ok_jpg:
-                push_binary_file_to_github(img_rel_path, buf.tobytes(), f"Add training image {stamp}.jpg")
-                ok_lbl, _ = push_file_to_github(lbl_rel_path, lbl_text, f"Add training labels {stamp}.txt")
+                ok_img, msg_img = push_binary_file_to_github(img_rel_path, buf.tobytes(), f"Add training image {stamp}.jpg")
+                if not ok_img:
+                    push_errors.append(f"পৃষ্ঠা {p_num} ছবি: {msg_img}")
+                    continue
+                ok_lbl, msg_lbl = push_file_to_github(lbl_rel_path, lbl_text, f"Add training labels {stamp}.txt")
                 if ok_lbl:
                     pushed_pages += 1
+                else:
+                    push_errors.append(f"পৃষ্ঠা {p_num} লেবেল: {msg_lbl}")
         doc.close()
         if pushed_pages > 0:
-            st.toast(f"☁️ {pushed_pages}টি পৃষ্ঠার ডেটা সরাসরি গিটহাবে yolo_dataset-এ সেভ হয়েছে!")
-    except Exception:
-        pass
+            st.toast(f"☁️ {pushed_pages}টি পৃষ্ঠার ডেটা সরাসরি গিটহাবে yolo_dataset-এ সেভ হয়েছে!")
+        if push_errors:
+            st.warning("⚠️ yolo_dataset গিটহাবে সেভ হয়নি: " + " | ".join(push_errors[:3]))
+    except Exception as e:
+        st.warning(f"⚠️ yolo_dataset সেভ ত্রুটি: {e}")
 
 def _order_items_reading(items):
     items = sorted(items, key=lambda it: (it[0].y0, it[0].x0))
