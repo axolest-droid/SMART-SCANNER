@@ -1,0 +1,79 @@
+/* =========================================================
+   ambient.css  —  ঘন কুয়াশা (fog) ব্যাকগ্রাউন্ড + ছোট কন্ট্রোল বাটন
+   (নতুন ফাইল: style.css বা app.py এর কোনো পুরোনো লাইন বদলায়নি)
+   কুয়াশা সবসময় চালু; বন্ধ করতে চাইলে এই ফাইলটি মুছে দিন।
+   ========================================================= */
+
+:root {
+    --amb-a: 94, 158, 139;    /* sage (অ্যাকসেন্টের সাথে মেলানো) */
+    --amb-b: 70, 112, 168;    /* ঠান্ডা নীল */
+    --amb-c: 120, 96, 170;    /* হালকা বেগুনি */
+}
+
+/* ---------- ঘন কুয়াশা (fog) ----------
+   কুয়াশা আঁকে sfx.js-এর <canvas id="ps-fog">।
+   canvas থাকে সবার পিছনে; তাই অ্যাপের ব্যাকগ্রাউন্ড স্বচ্ছ করা হয়েছে
+   আর গাঢ় রঙটি বসানো হয়েছে শুধু html-এ (রঙ একই: #0B0E14)। */
+/* গুরুত্বপূর্ণ: গাঢ় রঙ শুধু html-এ। body-তে রঙ থাকলে সেটা canvas-এর উপরে এসে কুয়াশা ঢেকে দেয় */
+html {
+    background-color: #0B0E14 !important;
+}
+body,
+#root,
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stHeader"] {
+    background: transparent !important;
+    background-color: transparent !important;
+}
+
+#ps-fog {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: -1;
+    pointer-events: none;
+    filter: blur(26px);          /* ছোট রেজোলিউশন + ব্লার = মসৃণ ঘন কুয়াশা */
+    transform: scale(1.06);      /* ব্লারের ধারের ফাঁক ঢাকতে */
+}
+
+/* ---------- নিচের বাম কোণের ছোট কন্ট্রোল (ডিভাইস-মোড বাটনের পাশে) ---------- */
+.ps-ctl-btn {
+    position: fixed;
+    bottom: 16px;
+    z-index: 99990;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(18, 23, 33, 0.78);
+    border: 1px solid rgba(94, 158, 139, 0.35);
+    backdrop-filter: blur(8px);
+    color: #6FB09D;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.55;
+    padding: 0;
+    transition: opacity 0.2s ease, transform 0.2s ease, color 0.2s ease;
+}
+.ps-ctl-btn:hover {
+    opacity: 1;
+    transform: scale(1.08);
+}
+.ps-ctl-btn svg {
+    width: 17px;
+    height: 17px;
+    stroke: currentColor;
+    stroke-width: 2;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+.ps-ctl-btn.ps-off {
+    color: #5b6573;
+    border-color: rgba(255, 255, 255, 0.10);
+}
+#ps-sfx-ctl { left: 60px; }
