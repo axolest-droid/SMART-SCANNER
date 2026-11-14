@@ -13,7 +13,33 @@ import requests
 import fitz
 import cv2
 import numpy as np
-import pytesseract
+import streamlit as st
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    from paddleocr import PaddleOCR
+except Exception:
+    PaddleOCR = None
+
+@st.cache_resource(show_spinner=False)
+def _get_le_paddle_ocr():
+    if PaddleOCR is None:
+        return None
+    for kwargs in (
+        {"use_angle_cls": True, "lang": "en", "show_log": False},
+        {"use_angle_cls": True, "lang": "en"},
+        {"lang": "en"},
+        {},
+    ):
+        try:
+            return PaddleOCR(**kwargs)
+        except Exception:
+            continue
+    return None
 import streamlit as st
 
 KB_FILENAME = "knowledge_base.json"
@@ -440,17 +466,48 @@ def _extract_lines_from_clip(page, clip_rect):
             g = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
             if g.mean() < 110:
                 g = 255 - g
-            bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 13)
-            data = pytesseract.image_to_data(bw, lang="eng+ben", config="--psm 6", output_type=pytesseract.Output.DICT)
-            for i in range(len(data["text"])):
-                t = data["text"][i].strip()
-                conf = int(data["conf"][i]) if str(data["conf"][i]).lstrip("-").isdigit() else -1
-                if t and conf >= 15:
-                    wx0 = clip_rect.x0 + data["left"][i] / sc
-                    wy0 = clip_rect.y0 + data["top"][i] / sc
-                    wx1 = wx0 + data["width"][i] / sc
-                    wy1 = wy0 + data["height"][i] / sc
-                    words.append((wx0, wy0, wx1, wy1, t))
+
+            eng = _get_le_paddle_ocr()
+            if eng is not None:
+                img_bgr = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+                raw = None
+                for fn in (lambda: eng.ocr(img_bgr, cls=True), lambda: eng.ocr(img_bgr), lambda: list(eng.predict(img_bgr))):
+                    try:
+                        raw = fn()
+                        break
+                    except Exception:
+                        continue
+                if raw:
+                    lines_out = []
+                    for p_item in raw:
+                        if not p_item:
+                            continue
+                        if isinstance(p_item, dict) or hasattr(p_item, "keys"):
+                            d = p_item if isinstance(p_item, dict) else dict(p_item)
+                            for t in d.get("rec_texts", []):
+                                if str(t).strip():
+                                    lines_out.append(str(t).strip())
+                        elif isinstance(p_item, (list, tuple)):
+                            for ln_item in p_item:
+                                if isinstance(ln_item, (list, tuple)) and len(ln_item) == 2 and isinstance(ln_item[1], (list, tuple)):
+                                    t = str(ln_item[1][0]).strip()
+                                    if t:
+                                        lines_out.append(t)
+                    if lines_out:
+                        return lines_out
+
+            if pytesseract is not None:
+                bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 13)
+                data = pytesseract.image_to_data(bw, lang="eng+ben", config="--psm 6", output_type=pytesseract.Output.DICT)
+                for i in range(len(data["text"])):
+                    t = data["text"][i].strip()
+                    conf = int(data["conf"][i]) if str(data["conf"][i]).lstrip("-").isdigit() else -1
+                    if t and conf >= 15:
+                        wx0 = clip_rect.x0 + data["left"][i] / sc
+                        wy0 = clip_rect.y0 + data["top"][i] / sc
+                        wx1 = wx0 + data["width"][i] / sc
+                        wy1 = wy0 + data["height"][i] / sc
+                        words.append((wx0, wy0, wx1, wy1, t))
         except Exception:
             pass
 
