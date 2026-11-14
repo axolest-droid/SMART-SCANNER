@@ -1,0 +1,70 @@
+name: Auto Train YOLO Model
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  train-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ১. গিটহাব রিপোজিটরি চেকআউট
+        uses: actions/checkout@v4
+
+      - name: ২. পাইথন সেটআপ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: ৩. প্রয়োজনীয় লাইব্রেরি ইনস্টল
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install ultralytics opencv-python-headless numpy
+
+      - name: ৪. yolo_dataset দিয়ে মডেল ট্রেইন এবং question_detector.pt আপডেট
+        run: |
+          python - << 'EOF'
+          import os, shutil
+          from ultralytics import YOLO
+
+          dataset_dir = os.path.abspath("yolo_dataset")
+          img_dir = os.path.join(dataset_dir, "images")
+          if not os.path.exists(img_dir) or not os.listdir(img_dir):
+              raise SystemExit("yolo_dataset/images ফোল্ডারে কোনো ছবি নেই!")
+
+          yaml_path = os.path.join(dataset_dir, "data.yaml")
+          with open(yaml_path, "w", encoding="utf-8") as f:
+              f.write(f"path: {dataset_dir}\ntrain: images\nval: images\nnc: 1\nnames:\n  0: question\n")
+
+          base_weights = "question_detector.pt" if os.path.exists("question_detector.pt") else "yolov8n.pt"
+          model = YOLO(base_weights)
+          results = model.train(
+              data=yaml_path,
+              epochs=45,
+              imgsz=1024,
+              batch=2,
+              workers=0,
+              fliplr=0.0,
+              flipud=0.0,
+              mosaic=0.0,
+              project="yolo_runs",
+              name="cloud_q_model",
+              exist_ok=True
+          )
+
+          best_pt = os.path.join(str(results.save_dir), "weights", "best.pt")
+          if os.path.exists(best_pt):
+              shutil.copy(best_pt, "question_detector.pt")
+              print("Successfully updated question_detector.pt!")
+          EOF
+
+      - name: ৫. নতুন question_detector.pt গিটহাবে অটো-সেভ
+        run: |
+          git config user.name "SmartScanner AI Bot"
+          git config user.email "bot@smartscanner.local"
+          git add question_detector.pt
+          git diff --staged --quiet || git commit -m "Auto-update trained question_detector.pt"
+          git push
