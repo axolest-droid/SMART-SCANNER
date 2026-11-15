@@ -1661,21 +1661,31 @@ def get_active_yolo_model():
         return None, f"লোড ত্রুটি: {e}"
 
 def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray_logs=None):
-    """ট্রেইন করা YOLOv8 মডেল দিয়ে প্রশ্ন বের করে এবং কালি ও মার্জিন অনুযায়ী নিখুঁতভাবে বক্স স্ন্যাপ করে।"""
+    """ট্রেইন করা YOLOv8 ডিটেকশন এবং সেগমেন্টেশন (BaDLAD) উভয় মডেল সাপোর্ট করে।"""
     yolo_sc = 2.0
     pix = page.get_pixmap(matrix=fitz.Matrix(yolo_sc, yolo_sc), alpha=False)
     img_rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-    # ১৭টি পাতায় ট্রেইন করা মডেলের Recall বাড়াতে conf=0.14 দেওয়া হয়েছে
-    preds = yolo_model.predict(source=img_bgr, conf=0.14, iou=0.40, imgsz=1024, verbose=False)
+    # BaDLAD মডেল অনেক বেশি বক্স দিতে পারে, তাই conf=0.25 রাখা হলো
+    preds = yolo_model.predict(source=img_bgr, conf=0.25, iou=0.45, imgsz=1024, verbose=False)
 
     h_px, w_px = ink_mask.shape[:2]
     raw_boxes = []
     for r in preds:
+        if r.boxes is None:
+            continue
         for box in r.boxes:
+            # সেগমেন্টেশন মাস্কের চারপাশের চতুর্ভুজ (Bounding box) বের করে আনা
             x0, y0, x1, y1 = [float(v) / yolo_sc for v in box.xyxy[0].tolist()]
             conf = float(box.conf[0])
+            cls_id = int(box.cls[0])
+            
+            # BaDLAD মডেলে 0=Paragraph, 1=Text Box, 2=Image, 3=Table
+            # আমরা ছবি বা টেবিল (2, 3) এড়িয়ে যাব, আর আপনার পুরোনো মডেলের 0=question তো কাজ করবেই।
+            if cls_id > 1:
+                continue
+
             bw, bh = x1 - x0, y1 - y0
 
             if bw < 50.0 or bh < float(MIN_Q_HEIGHT_PT):
@@ -1685,7 +1695,6 @@ def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray
             if y0 < 30.0 or y1 > (H - 25.0):
                 continue
 
-            # দুই কলামের মাঝখানের বিভাজক রেখা এপার-ওপার কেটে গেলে তা বাদ দেওয়া
             if x0 < (W * 0.42) and x1 > (W * 0.58):
                 continue
 
@@ -1694,7 +1703,6 @@ def extract_page_questions_with_yolo(yolo_model, page, ink_mask, W, H, pno, xray
             x1 = min(W - 4.0, x1 - RIGHT_EDGE_TRIM_PT)
             y1 = min(H - 4.0, y1)
 
-            # বক্সের ভেতরে আসলেই লেখার কালি আছে কি না পরীক্ষা করা
             sub_ink = ink_mask[max(0, int(y0 * SC)):min(h_px, int(y1 * SC)), max(0, int(x0 * SC)):min(w_px, int(x1 * SC))]
             if sub_ink.size == 0 or float(sub_ink.mean()) < 0.008:
                 continue
