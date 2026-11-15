@@ -1643,20 +1643,29 @@ def _load_yolo_cached(abs_path, file_mtime, file_size):
 
 def get_active_yolo_model():
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(base_dir, "question_detector.pt"),
-        os.path.abspath("question_detector.pt"),
-        os.path.join(base_dir, "runs", "detect", "yolo_runs", "q_model", "weights", "best.pt"),
-    ]
-    found_path = next((p for p in candidates if os.path.exists(p)), None)
-    if not found_path:
-        return None, "ফোল্ডারে question_detector.pt পাওয়া যায়নি!"
+    target_model = os.path.join(base_dir, "question_detector.pt")
+
+    # ফোল্ডারে মডেল না থাকলে Hugging Face থেকে সরাসরি ডাউনলোড করে নেবে
+    if not os.path.exists(target_model):
+        import requests
+        url = "https://huggingface.co/bengaliAI/badlad-yolov8m-seg/resolve/main/best.pt"
+        try:
+            with st.spinner("✨ প্রথমবারের মতো 52MB এর শক্তিশালী বাংলা এআই (BaDLAD) মডেল ডাউনলোড হচ্ছে... দয়া করে একটু অপেক্ষা করুন ⏳"):
+                resp = requests.get(url, stream=True)
+                resp.raise_for_status()
+                with open(target_model, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                st.toast("✅ মডেল ডাউনলোড সফল হয়েছে!")
+        except Exception as e:
+            return None, f"মডেল ডাউনলোডে ত্রুটি: {e}"
+
     try:
-        mtime = os.path.getmtime(found_path)
-        fsize = os.path.getsize(found_path)
-        model = _load_yolo_cached(found_path, mtime, fsize)
+        mtime = os.path.getmtime(target_model)
+        fsize = os.path.getsize(target_model)
+        model = _load_yolo_cached(target_model, mtime, fsize)
         size_mb = fsize / (1024 * 1024)
-        return model, f"সক্রিয় ({os.path.basename(found_path)} • {size_mb:.1f} MB)"
+        return model, f"সক্রিয় (BaDLAD Bengali AI • {size_mb:.1f} MB)"
     except Exception as e:
         return None, f"লোড ত্রুটি: {e}"
 
